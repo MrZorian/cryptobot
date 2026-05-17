@@ -1,16 +1,10 @@
 {
-  "name": "cryptobot-pro-server",
-  "version": "1.0.0",
-  "description": "CryptoBot Pro — 24/7 trading server",
+  "name": "cryptobot-pro",
+  "version": "4.0.0",
+  "description": "CryptoBot Pro — Fast Scalp Engine for MEXC",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
-  },
-  "engines": {
-    "node": ">=16.0.0"
-  },
-  "dependencies": {},
-  "keywords": ["crypto", "trading", "bot"],
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "ws": "^8.16.0" },
+  "engines": { "node": ">=18.0.0" },
   "license": "MIT"
 }
