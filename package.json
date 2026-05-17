@@ -1,0 +1,16 @@
+{
+  "name": "cryptobot-pro-server",
+  "version": "1.0.0",
+  "description": "CryptoBot Pro — 24/7 trading server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {},
+  "keywords": ["crypto", "trading", "bot"],
+  "license": "MIT"
+}
