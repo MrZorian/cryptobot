@@ -333,19 +333,38 @@ function getSignal(px) {
 }
 
 // ── FEE MATH ──────────────────────────────────────────────────────────────────
+// MEXC fee model:
+//   BUY:  you spend amt USDT, pay fee = amt * TAKER (deducted from coins received)
+//   SELL: you receive proceeds USDT, pay fee = proceeds * TAKER (deducted from USDT)
+// Net = proceeds - amt - buyFee_in_USDT - sellFee
+// buyFee_in_USDT = (amt * TAKER / entryPx) * entryPx = amt * TAKER  (simplified)
 function feeMath(entryPx, exitPx, amt) {
-  const qty      = amt / entryPx;
-  const proceeds = qty * exitPx;
-  const fee      = amt * TAKER + proceeds * TAKER;
-  const net      = proceeds - amt - fee;
-  return {fee, net, qty, proceeds};
+  // Coins bought (after buy fee deducted from coins)
+  const qtyAfterFee = (amt / entryPx) * (1 - TAKER);
+  // Proceeds from selling those coins (before sell fee)
+  const grossProceeds = qtyAfterFee * exitPx;
+  // Sell fee deducted from proceeds
+  const sellFee = grossProceeds * TAKER;
+  const netProceeds = grossProceeds - sellFee;
+  // Net P&L
+  const net = netProceeds - amt;
+  // Total fee in USDT (approximate buy fee + sell fee)
+  const buyFee  = (amt / entryPx) * TAKER * entryPx;  // = amt * TAKER
+  const fee     = buyFee + sellFee;
+  return {fee, net, qty:qtyAfterFee, proceeds:netProceeds, gross:grossProceeds};
+}
+
+function breakEven(entryPx, amt) {
+  // Exact break-even exit price (net = 0)
+  // qtyAfterFee * exitPx * (1 - TAKER) = amt
+  // exitPx = amt / (qtyAfterFee * (1 - TAKER))
+  const qtyAfterFee = (amt / entryPx) * (1 - TAKER);
+  return amt / (qtyAfterFee * (1 - TAKER));
 }
 
 function minTP(entryPx, amt) {
-  // Minimum exit price to guarantee net profit after fees
-  const qty = amt / entryPx;
-  const beBreak = (amt*(1+TAKER)) / (qty*(1-TAKER));
-  return beBreak * (1 + MIN_NET);
+  // Minimum TP price: break-even + MIN_NET margin
+  return breakEven(entryPx, amt) * (1 + MIN_NET);
 }
 
 // ── MAIN TICK ─────────────────────────────────────────────────────────────────
@@ -402,7 +421,11 @@ function onTick(px) {
 // ── ENTER TRADE ───────────────────────────────────────────────────────────────
 function enter(px, reason, isPaper) {
   const amt  = S.capital / S.maxPos;
-  const tp   = parseFloat(Math.max(px*(1+S.tpPct/100), minTP(px,amt)).toFixed(8));
+  // TP must be max of: configured %, and break-even+MIN_NET
+  // Add extra 0.02% buffer above min to account for price rounding
+  const configTp = px * (1 + S.tpPct/100);
+  const safeTpPx = minTP(px, amt) * 1.0002;  // tiny buffer above theoretical min
+  const tp = parseFloat(Math.max(configTp, safeTpPx).toFixed(8));
   const sl   = parseFloat((px*(1-S.slPct/100)).toFixed(8));
   const trail= parseFloat((px*(1-S.trailPct/100)).toFixed(8));
 
@@ -441,13 +464,38 @@ function exitCheck(px, isPaper) {
     }
 
     let why = null;
-    if      (px >= o.tp)                               why = 'TP';
-    else if (px <= o.sl)                               why = 'SL';
-    else if (o.trailStop > o.sl && px <= o.trailStop)  why = 'TRAIL';
+    let exitAt = px;  // actual price we use for P&L calc
+
+    if (px >= o.tp) {
+      why    = 'TP';
+      exitAt = o.tp;  // use exact TP price, not poll price (avoids overshoot distortion)
+    } else if (o.trailStop > o.sl && px <= o.trailStop) {
+      // TRAIL: only fire if we're actually in profit at trail price
+      const {net:trailNet} = feeMath(o.entryPx, o.trailStop, o.amt);
+      if (trailNet > 0) {
+        why    = 'TRAIL';
+        exitAt = o.trailStop;  // use exact trail stop price
+      }
+      // If trail would give a loss, widen it to break-even and wait
+      else {
+        const be = breakEven(o.entryPx, o.amt);
+        o.trailStop = be * 1.0002;  // move trail to just above break-even
+      }
+    } else if (px <= o.sl) {
+      why    = 'SL';
+      exitAt = o.sl;  // use exact SL price
+    }
 
     if (!why) return;
 
-    const {fee, net} = feeMath(o.entryPx, px, o.amt);
+    const {fee, net, gross} = feeMath(o.entryPx, exitAt, o.amt);
+
+    // SAFETY GUARD: If TP exit somehow still shows loss (shouldn't happen),
+    // log a warning but still close — don't let position stay open forever
+    if (why === 'TP' && net < 0) {
+      log(`⚠ TP exit negative net=$${net.toFixed(6)} entry=$${o.entryPx} tp=$${exitAt} — check TP config`, 'err');
+    }
+
     o.status = 'closed';
     changed  = true;
 
@@ -456,8 +504,9 @@ function exitCheck(px, isPaper) {
       time:new Date().toISOString().slice(11,19),
       dur:o.openAt?`${o.openAt}→${new Date().toISOString().slice(11,19)}`:'',
       pair:S.pair, strat:o.strat, isPaper,
-      side:why, entryPx:o.entryPx, exitPx:px,
-      amt:o.amt, fee:+fee.toFixed(6), net:+net.toFixed(6)
+      side:why, entryPx:o.entryPx, exitPx:exitAt,
+      amt:o.amt, fee:+fee.toFixed(6),
+      gross:+gross.toFixed(6), net:+net.toFixed(6)
     };
 
     if (isPaper) {
@@ -465,13 +514,15 @@ function exitCheck(px, isPaper) {
       if(net>=0){S.papW++;if(net>S.papBest)S.papBest=net;}else S.papL++;
       S.papTrades.unshift(tr);
       if(S.papTrades.length>200)S.papTrades.length=200;
-      log(`📝 PAPER ${why} @ $${px.toFixed(4)} entry=$${o.entryPx.toFixed(4)} fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`,'profit');
+      const pnlStr = `gross=${gross>=0?'+':''}$${gross.toFixed(4)} fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`;
+      log(`📝 PAPER ${why} entry=$${o.entryPx.toFixed(4)} exit=$${exitAt.toFixed(4)} | ${pnlStr}`, net>=0?'profit':'err');
     } else {
       S.liveProfit+=net; S.todayP+=net; S.feesT+=fee;
       if(net>=0){S.liveW++;if(net>S.bestT)S.bestT=net;}else S.liveL++;
       S.liveTrades.unshift(tr);
       if(S.liveTrades.length>200)S.liveTrades.length=200;
-      log(`💰 LIVE ${why} @ $${px.toFixed(4)} entry=$${o.entryPx.toFixed(4)} fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`,net>=0?'sell':'err');
+      const livePnlStr = `gross=${gross>=0?'+':''}$${gross.toFixed(4)} fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`;
+      log(`💰 LIVE ${why} entry=$${o.entryPx.toFixed(4)} exit=$${exitAt.toFixed(4)} | ${livePnlStr}`, net>=0?'sell':'err');
       placeOrder('SELL', o.qty, S.pair);
     }
     save();
