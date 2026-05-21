@@ -568,54 +568,45 @@ function exitCheck(px, isPaper) {
 // Do NOT add any extra params after signing.
 
 function mexcRequest(method, urlPath, params, apiKey, apiSecret, callback) {
-  // Step 1: add timestamp and recvWindow
+  // MEXC v3 signing — ALL params including timestamp go in query string
+  // For both GET and POST: params are in URL query string, body is empty
+  // Content-Type must NOT be set (MEXC rejects it with code 700013)
+
   const allParams = {
     ...params,
     timestamp:  Date.now().toString(),
     recvWindow: '5000'
   };
 
-  // Step 2: build raw query string (no url-encoding) for signature
+  // Build raw query string for signing (no url-encoding of values)
   const rawQS = Object.keys(allParams)
     .map(k => `${k}=${allParams[k]}`)
     .join('&');
 
-  // Step 3: sign
+  // Sign with HMAC-SHA256
   const signature = crypto
     .createHmac('sha256', apiSecret)
     .update(rawQS)
     .digest('hex');
 
-  // Step 4: build final query string WITH signature
+  // Final URL: all params + signature in query string
   const finalQS = rawQS + '&signature=' + signature;
+  const reqPath = `${urlPath}?${finalQS}`;
 
-  // Step 5: set up request
-  let reqPath, reqBody, headers;
+  // Headers: API key only, NO Content-Type
+  const headers = {
+    'X-MEXC-APIKEY': apiKey,
+    'Accept':        'application/json',
+    'User-Agent':    'CryptoBotPro/1.0'
+  };
 
-  if (method === 'GET') {
-    reqPath  = `${urlPath}?${finalQS}`;
-    reqBody  = '';
-    headers  = {
-      'X-MEXC-APIKEY': apiKey,
-      'Accept':        'application/json',
-      'User-Agent':    'CryptoBotPro/1.0'
-    };
-  } else {
-    // POST: params go in body, NOT in URL
-    reqPath  = urlPath;
-    reqBody  = finalQS;
-    headers  = {
-      'X-MEXC-APIKEY':  apiKey,
-      'Content-Type':   'application/x-www-form-urlencoded',
-      'Content-Length': Buffer.byteLength(reqBody).toString(),
-      'Accept':         'application/json',
-      'User-Agent':     'CryptoBotPro/1.0'
-    };
-  }
+  // Body is always empty — params are in URL
+  const reqBody = '';
+  let reqPathFinal = reqPath;
 
   const opts = {
     hostname: 'api.mexc.com',
-    path:     reqPath,
+    path:     reqPathFinal,
     method,
     headers,
     timeout: 8000
@@ -631,8 +622,7 @@ function mexcRequest(method, urlPath, params, apiKey, apiSecret, callback) {
   });
   req.on('error',   e => callback(e));
   req.on('timeout', () => { req.destroy(); callback(new Error('timeout')); });
-  if (reqBody) req.write(reqBody);
-  req.end();
+  req.end();  // No body — params are in URL query string
 }
 
 // ─── PLACE ORDER ─────────────────────────────────────────────────────────────
