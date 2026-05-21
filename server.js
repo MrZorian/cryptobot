@@ -73,12 +73,12 @@ let S = {
   pair:     ENV_PAIR,
   capital:  ENV_CAP,
   maxPos:   3,
-  tpPct:    0.45,        // take profit % (covers 0.10% fee + 0.35% net profit)
-  slPct:    0.35,        // stop loss % (wider = fewer false SL triggers)
-  trailPct: 0.15,        // trailing stop %
+  tpPct:    0.50,        // 0.50% TP = 0.40% net after fees = $0.053 per $13.33 pos
+  slPct:    0.40,        // 0.40% SL — wider than TP is impossible, this is fine
+  trailPct: 0.20,        // 0.20% trail — only activates after 60% toward TP
   maxDaily: 200,
-  cooldown: 10000,       // ms between entries (10 seconds)
-  warmup:   20,          // ticks needed before trading
+  cooldown: 10000,       // 10 seconds between entries
+  warmup:   20,          // 20 ticks = ~30 seconds to warm up
 
   // Live stats
   liveProfit:0, todayP:0, liveT:0, liveW:0, liveL:0, bestT:0, feesT:0,
@@ -422,13 +422,19 @@ function onTick(px) {
   }
 
   if (S.mode === 'live' && S.apiKey && S.apiSecret) {
-    // Live has its own cooldown so paper entries don't block it
     const liveCD = (now - (S.lastLiveEntry||0)) >= S.cooldown;
     if (liveCD) {
       const liveOpen = S.liveOrders.filter(o=>o.status==='open').length;
       if (liveOpen < S.maxPos && S.liveT < S.maxDaily) {
-        enter(px, sig.reason, false);
-        S.lastLiveEntry = now;
+        // Check position size is tradeable (MEXC minimum 5 USDT for BTC/USDT)
+        const posSize = S.capital / S.maxPos;
+        const MEXC_MIN = 5.0;
+        if (posSize < MEXC_MIN) {
+          if (ticks % 50 === 0) log(`⚠ Position size $${posSize.toFixed(2)} below MEXC minimum $${MEXC_MIN}. Increase capital or reduce maxPos.`, 'err');
+        } else {
+          enter(px, sig.reason, false);
+          S.lastLiveEntry = now;
+        }
       }
     }
   }
@@ -450,7 +456,9 @@ function enter(px, reason, isPaper) {
   // Log the guaranteed profit amount for transparency
   const guaranteedNet = (tp - px) / px * 100 - RT_FEE * 100;
   const sl   = parseFloat((px*(1-S.slPct/100)).toFixed(8));
-  const trail= parseFloat((px*(1-S.trailPct/100)).toFixed(8));
+  // Trail starts at entry - trailPct% (below entry)
+  // It will move UP as price rises, only activating after 60% toward TP
+  const trail = parseFloat((px*(1-S.trailPct/100)).toFixed(8));
 
   const o = {
     id: Date.now()+(isPaper?1:0),
@@ -463,11 +471,11 @@ function enter(px, reason, isPaper) {
 
   if (isPaper) {
     S.papOrders.push(o);
-    log(`📝 PAPER BUY ${S.strategy} @ $${px.toFixed(4)} TP=$${tp.toFixed(4)} SL=$${sl.toFixed(4)} [${reason}]`,'buy');
+    log(`📝 PAPER BUY ${S.strategy} @ $${px.toFixed(2)} | $${amt.toFixed(2)}/pos TP=$${tp.toFixed(2)} SL=$${sl.toFixed(2)}`,'buy');
   } else {
     S.liveOrders.push(o);
-    log(`💰 LIVE BUY ${S.strategy} @ $${px.toFixed(4)} | amt=$${amt.toFixed(2)} qty=${o.qty.toFixed(6)} | TP=$${tp.toFixed(4)} SL=$${sl.toFixed(4)} [${reason}]`,'buy');
-    log(`💰 Placing MEXC market order: BUY ${o.qty.toFixed(6)} ${S.pair}`,'buy');
+    const expectedNet = ((tp - px) / px * 100 - RT_FEE * 100).toFixed(3);
+    log(`💰 LIVE BUY @ $${px.toFixed(2)} | pos=$${amt.toFixed(2)} TP=$${tp.toFixed(2)}(+${((tp-px)/px*100).toFixed(3)}%) SL=$${sl.toFixed(2)} | expected net ~${expectedNet}%`,'buy');
     placeOrder('BUY', o.qty, S.pair);
   }
 }
@@ -494,22 +502,27 @@ function exitCheck(px, isPaper) {
       why    = 'TP';
       exitAt = o.tp;  // use exact TP price, not poll price (avoids overshoot distortion)
     } else if (o.trailStop > o.sl && px <= o.trailStop) {
-      // TRAIL: only fire if we're actually in profit at trail price
-      const {net:trailNet} = feeMath(o.entryPx, o.trailStop, o.amt);
-      if (trailNet > 0) {
-        why    = 'TRAIL';
-        exitAt = o.trailStop;  // use exact trail stop price
+      // Trail only fires if price has moved at least 60% of the way to TP
+      // This prevents cutting profits too early on small bounces
+      const totalRange  = o.tp - o.entryPx;
+      const movedSoFar  = o.highSince - o.entryPx;
+      const pctTowardTP = totalRange > 0 ? movedSoFar / totalRange : 0;
+
+      if (pctTowardTP >= 0.60) {
+        // Price moved 60%+ toward TP — trail can fire to lock profit
+        const {net:trailNet} = feeMath(o.entryPx, o.trailStop, o.amt);
+        if (trailNet > 0) {
+          why    = 'TRAIL';
+          exitAt = o.trailStop;
+        }
+        // else: trail would be loss — wait for TP
       }
-      // If trail would give a loss, widen it to break-even and wait
-      else {
-        const be = breakEven(o.entryPx, o.amt);
-        o.trailStop = be * 1.0002;  // move trail to just above break-even
-      }
+      // else: price hasn't moved enough — ignore trail, wait for TP or SL
     } else if (px <= o.sl) {
-      // Don't fire SL if price is within 0.05% of TP (prevent whipsaw)
+      // Don't fire SL if price is within 0.10% of TP (prevent whipsaw)
       const distToTp = (o.tp - px) / px * 100;
-      if (distToTp < 0.05) {
-        // Very close to TP — hold and wait
+      if (distToTp < 0.10) {
+        // Very close to TP — hold and don't cut
       } else {
         why    = 'SL';
         exitAt = o.sl;
@@ -545,14 +558,17 @@ function exitCheck(px, isPaper) {
       S.papTrades.unshift(tr);
       if(S.papTrades.length>200)S.papTrades.length=200;
       const pnlStr = `gross=${gross>=0?'+':''}$${gross.toFixed(4)} fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`;
-      log(`📝 PAPER ${why} entry=$${o.entryPx.toFixed(4)} exit=$${exitAt.toFixed(4)} | ${pnlStr}`, net>=0?'profit':'err');
+      const movePct = o.entryPx>0 ? ((exitAt-o.entryPx)/o.entryPx*100).toFixed(3) : '?';
+      log(`📝 PAPER ${why} entry=$${o.entryPx.toFixed(2)} exit=$${exitAt.toFixed(2)} move=${movePct}% | ${pnlStr}`, net>=0?'profit':'err');
     } else {
       S.liveProfit+=net; S.todayP+=net; S.feesT+=fee;
       if(net>=0){S.liveW++;if(net>S.bestT)S.bestT=net;}else S.liveL++;
       S.liveTrades.unshift(tr);
       if(S.liveTrades.length>200)S.liveTrades.length=200;
       const livePnlStr = `gross=${gross>=0?'+':''}$${gross.toFixed(4)} fee=$${fee.toFixed(4)} NET=${net>=0?'+':''}$${net.toFixed(4)}`;
-      log(`💰 LIVE ${why} entry=$${o.entryPx.toFixed(4)} exit=$${exitAt.toFixed(4)} | ${livePnlStr}`, net>=0?'sell':'err');
+      const liveMovePct = o.entryPx>0 ? ((exitAt-o.entryPx)/o.entryPx*100).toFixed(3) : '?';
+      log(`💰 LIVE ${why} entry=$${o.entryPx.toFixed(2)} exit=$${exitAt.toFixed(2)} move=${liveMovePct}% | ${livePnlStr}`, net>=0?'sell':'err');
+      if(net>0) log(`💰 Expected wallet change: +$${(net).toFixed(4)} USDT in MEXC Spot`, 'profit');
       placeOrder('SELL', o.qty, S.pair);
     }
     save();
@@ -910,7 +926,10 @@ const server = http.createServer((req, res) => {
       }
       if(S.mode==='live') S.lastLiveEntry=0;
       save();
-      log(`Config: ${S.pair} MODE=${S.mode} tp=${S.tpPct}% sl=${S.slPct}% keys=${!!(S.apiKey&&S.apiSecret)}`,'info');
+      const posSize = S.capital / S.maxPos;
+      log(`Config: ${S.pair} MODE=${S.mode} tp=${S.tpPct}% sl=${S.slPct}% pos=$${posSize.toFixed(2)} keys=${!!(S.apiKey&&S.apiSecret)}`,'info');
+      if (posSize < 5) log(`⚠ Position size $${posSize.toFixed(2)} is below MEXC minimum $5. Reduce maxPos or increase capital.`,'err');
+      if (S.apiKey && S.apiKey.length < 20) log(`⚠ API key len=${S.apiKey.length} seems short. Real MEXC keys are 30+ chars. Re-copy full key from MEXC.`,'err');
       send(res, 200, {ok:true, tpPct:S.tpPct, slPct:S.slPct, mode:S.mode, hasKeys:!!(S.apiKey&&S.apiSecret)});
       return;
     }
