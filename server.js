@@ -456,15 +456,13 @@ function enter(px, reason, isPaper) {
   // Log the guaranteed profit amount for transparency
   const guaranteedNet = (tp - px) / px * 100 - RT_FEE * 100;
   const sl   = parseFloat((px*(1-S.slPct/100)).toFixed(8));
-  // Trail starts at entry - trailPct% (below entry)
-  // It will move UP as price rises, only activating after 60% toward TP
-  const trail = parseFloat((px*(1-S.trailPct/100)).toFixed(8));
+  const trail = 0; // trail disabled — TP/SL only
 
   const o = {
     id: Date.now()+(isPaper?1:0),
     status:'open', isPaper, strat:S.strategy,
     entryPx:px, amt, qty:amt/px,
-    tp, sl, trailStop:trail, highSince:px,
+    tp, sl,
     openAt:new Date().toISOString().slice(11,19),
     reason
   };
@@ -488,45 +486,16 @@ function exitCheck(px, isPaper) {
   orders.forEach(o => {
     if (o.status !== 'open') return;
 
-    // Update trailing stop
-    if (px > o.highSince) {
-      o.highSince = px;
-      const newTrail = px * (1 - S.trailPct/100);
-      if (newTrail > o.trailStop) o.trailStop = newTrail;
-    }
-
+    // Simple exits: only TP or SL — no trailing stop
     let why = null;
-    let exitAt = px;  // actual price we use for P&L calc
+    let exitAt = px;
 
     if (px >= o.tp) {
       why    = 'TP';
-      exitAt = o.tp;  // use exact TP price, not poll price (avoids overshoot distortion)
-    } else if (o.trailStop > o.sl && px <= o.trailStop) {
-      // Trail only fires if price has moved at least 60% of the way to TP
-      // This prevents cutting profits too early on small bounces
-      const totalRange  = o.tp - o.entryPx;
-      const movedSoFar  = o.highSince - o.entryPx;
-      const pctTowardTP = totalRange > 0 ? movedSoFar / totalRange : 0;
-
-      if (pctTowardTP >= 0.60) {
-        // Price moved 60%+ toward TP — trail can fire to lock profit
-        const {net:trailNet} = feeMath(o.entryPx, o.trailStop, o.amt);
-        if (trailNet > 0) {
-          why    = 'TRAIL';
-          exitAt = o.trailStop;
-        }
-        // else: trail would be loss — wait for TP
-      }
-      // else: price hasn't moved enough — ignore trail, wait for TP or SL
+      exitAt = o.tp;   // exact TP price
     } else if (px <= o.sl) {
-      // Don't fire SL if price is within 0.10% of TP (prevent whipsaw)
-      const distToTp = (o.tp - px) / px * 100;
-      if (distToTp < 0.10) {
-        // Very close to TP — hold and don't cut
-      } else {
-        why    = 'SL';
-        exitAt = o.sl;
-      }
+      why    = 'SL';
+      exitAt = o.sl;   // exact SL price
     }
 
     if (!why) return;
