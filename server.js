@@ -1329,7 +1329,6 @@ function buildMarketContext(px, isFutures) {
 }
 
 function buildPrompt(ctx) {
-function buildPrompt(ctx) {
   var isFut = ctx.type.indexOf("FUTURES") !== -1;
   var shortLine = isFut ? "- SHORT: RSI>60, EMA bearish, price at resistance -> open short\n" : "";
   var p = "";
@@ -1832,4 +1831,3 @@ server.listen(PORT, '0.0.0.0', () => {
 server.on('error', e => { console.error(e); process.exit(1); });
 process.on('SIGTERM', ()=>{ save(); process.exit(0); });
 process.on('SIGINT',  ()=>{ save(); process.exit(0); });
-};
