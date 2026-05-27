@@ -695,66 +695,93 @@ async function callAI(px, isFutures) {
   if (isFutures) S.aiFutLastCall = now; else S.aiLastCall = now;
   S.aiCallCount++;
 
-  const raw = (isFutures ? futPX : PX).filter(v=>v>0);
-  const n   = raw.length;
-  const r14 = n > 2 ? calcRSI(raw, Math.min(14,n-1)).toFixed(1) : '50';
-  const e9  = n > 0 ? calcEMA(raw, Math.min(9,n)).toFixed(2) : px.toFixed(2);
-  const e21 = n > 0 ? calcEMA(raw, Math.min(21,n)).toFixed(2) : px.toFixed(2);
-  const bb  = n >= 10 ? calcBB(raw, Math.min(20,n)) : null;
-  const hi  = n > 0 ? Math.max(...raw.slice(-Math.min(10,n))) : px;
-  const dip = ((px-hi)/hi*100).toFixed(3);
-  const ch1 = n > 1 ? ((px-raw[n-2])/raw[n-2]*100).toFixed(4) : '0';
-  const trades = (isFutures ? S.futTrades : S.liveTrades).slice(0,5)
-    .map(t => t.side+(t.net>=0?'+':'')+t.net.toFixed(3)).join(' ');
-  const profit = isFutures ? S.futProfit : S.liveProfit;
-  const wr     = isFutures ? (S.futT>0?Math.round(S.futW/S.futT*100):0) : (S.liveT>0?Math.round(S.liveW/S.liveT*100):0);
-  const lev    = isFutures ? S.futLeverage+'x lev' : 'spot';
-  const tp     = isFutures ? S.futTpPct : S.tpPct;
-  const sl     = isFutures ? S.futSlPct : S.slPct;
-  const fee    = isFutures ? '0.04%' : '0.10%';
+  const raw  = (isFutures ? futPX : PX.map(function(p){return p.px||p;})).filter(function(v){return v>0;});
+  const n    = raw.length;
+  const r14  = n>2  ? calcRSI(raw, Math.min(14,n-1)) : 50;
+  const r9   = n>2  ? calcRSI(raw, Math.min(9,n-1))  : 50;
+  const e9   = n>0  ? calcEMA(raw, Math.min(9,n))    : px;
+  const e21  = n>0  ? calcEMA(raw, Math.min(21,n))   : px;
+  const bb   = n>=10? calcBB(raw, Math.min(20,n))    : null;
+  const hi10 = n>0  ? Math.max.apply(null,raw.slice(-Math.min(10,n))) : px;
+  const lo10 = n>0  ? Math.min.apply(null,raw.slice(-Math.min(10,n))) : px;
+  const dip  = ((px-hi10)/hi10*100).toFixed(3);
+  const ch1  = n>1  ? ((px-raw[n-2])/raw[n-2]*100).toFixed(4) : '0';
+  const ch5  = n>5  ? ((px-raw[n-6])/raw[n-6]*100).toFixed(4) : '0';
+  const vol  = hi10>0 ? ((hi10-lo10)/lo10*100).toFixed(4) : '0';
+  const trend= e9>e21*1.0002?'UPTREND':e9<e21*0.9998?'DOWNTREND':'SIDEWAYS';
+  const bbPos= bb?(px<=bb.lower*1.002?'AT_SUPPORT':px>=bb.upper*0.998?'AT_RESISTANCE':px<bb.middle?'LOWER_HALF':'UPPER_HALF'):'UNKNOWN';
+  const recentPx = raw.slice(-8).map(function(v){return v.toFixed(0);}).join(',');
 
-  var p = 'You are an autonomous crypto trading agent. Manage real money. Goal: grow the account.\n';
-  p += 'Account: profit=$' + profit.toFixed(4) + ' winRate=' + wr + '% recentTrades=' + (trades||'none') + '\n';
-  p += 'Market ' + (isFutures?S.futPair+' futures '+lev:S.pair+' spot') + ':\n';
-  p += 'Price=$' + px + ' RSI14=' + r14 + ' EMA9=$' + e9 + ' EMA21=$' + e21 + '\n';
-  p += 'Dip=' + dip + '% ch1=' + ch1 + '%\n';
-  if (bb) p += 'BB lower=$' + bb.lower.toFixed(2) + ' mid=$' + bb.middle.toFixed(2) + ' upper=$' + bb.upper.toFixed(2) + '\n';
-  p += 'Settings: TP=' + tp + '% SL=' + sl + '% fee=' + fee + '\n';
+  const allTrades = (isFutures ? S.futTrades : S.liveTrades).slice(0,10);
+  const papTrades = (isFutures ? S.futPapTrades||[] : S.papTrades).slice(0,5);
+  const tradeStr  = allTrades.map(function(t){return t.side+(t.net>=0?'+':'')+parseFloat(t.net).toFixed(3);}).join(' ')||'none';
+  const papStr    = papTrades.map(function(t){return t.side+(t.net>=0?'+':'')+parseFloat(t.net).toFixed(3);}).join(' ')||'none';
+  const recentLoss = allTrades.slice(0,3).filter(function(t){return t.net<0;}).length;
+  const last5net   = allTrades.slice(0,5).reduce(function(s,t){return s+t.net;},0);
 
-  // Include open positions so AI can decide to close them
+  const profit = isFutures ? S.futProfit  : S.liveProfit;
+  const totalT = isFutures ? S.futT       : S.liveT;
+  const wins   = isFutures ? S.futW       : S.liveW;
+  const wr     = totalT>0 ? Math.round(wins/totalT*100) : 0;
+  const cap    = isFutures ? S.futCapital : S.capital;
+  const maxPos = isFutures ? S.futMaxPos  : S.maxPos;
+  const lev    = isFutures ? S.futLeverage : 1;
+  const feeRT  = isFutures ? 0.04 : 0.10;
+  const posSize = cap / maxPos;
+  const notional = posSize * lev;
+
   var openPos = (isFutures
-    ? [...S.futOrders,...S.futPapOrders]
-    : [...S.liveOrders,...S.papOrders]).filter(function(o){return o.status==='open';});
-  if (openPos.length > 0) {
-    p += 'OPEN POSITIONS (you can close any of these):\n';
+    ? S.futOrders.concat(S.futPapOrders)
+    : S.liveOrders.concat(S.papOrders)).filter(function(o){return o.status==='open';});
+
+  var p = '';
+  p += '=== CRYPTO TRADING AGENT ===\n';
+  p += 'You manage REAL money. Every bad trade = real loss. Be SELECTIVE.\n\n';
+  p += '=== ACCOUNT ===\n';
+  p += 'Capital: $'+cap+' | Per-pos: $'+posSize.toFixed(2);
+  if (isFutures) p += ' x'+lev+'lev = $'+notional.toFixed(2)+' notional';
+  p += '\n';
+  p += 'Total P&L: $'+profit.toFixed(4)+' | Win rate: '+wr+'% ('+wins+'/'+totalT+')\n';
+  p += 'Last 5 net sum: $'+last5net.toFixed(4)+(last5net<0?' LOSING':'  profitable')+'\n';
+  p += 'Live trades: '+tradeStr+'\n';
+  p += 'Paper trades: '+papStr+'\n';
+  if (recentLoss>=2) p += 'WARNING: '+recentLoss+'/3 recent trades LOST. Be very conservative.\n';
+  p += '\n=== MARKET ('+( isFutures?S.futPair+' FUT':S.pair+' SPOT')+') ===\n';
+  p += 'Price: $'+px.toFixed(2)+' | Trend: '+trend+'\n';
+  p += 'RSI14: '+r14.toFixed(1)+' RSI9: '+r9.toFixed(1)+'\n';
+  p += 'EMA9: $'+e9.toFixed(2)+' EMA21: $'+e21.toFixed(2)+'\n';
+  if (bb) p += 'BB: low=$'+bb.lower.toFixed(2)+' mid=$'+bb.middle.toFixed(2)+' hi=$'+bb.upper.toFixed(2)+' pos='+bbPos+'\n';
+  p += 'Dip: '+dip+'% | ch1: '+ch1+'% | ch5: '+ch5+'% | vol: '+vol+'%\n';
+  p += 'Recent prices: '+recentPx+'\n';
+  p += 'Fee RT: '+feeRT+'%\n\n';
+
+  if (openPos.length>0) {
+    p += '=== OPEN POSITIONS ===\n';
     openPos.forEach(function(o,i) {
-      var isLng = o.direction !== 'SHORT';
-      var curNet = isFutures
-        ? futFee(o.entryPx, px, o.margin||10, o.leverage||3, isLng).net
-        : feeMath(o.entryPx, px, o.amt||10).net;
-      var movePct = ((px - o.entryPx)/o.entryPx*100).toFixed(3);
-      p += '  pos['+i+']: '+(o.direction||'LONG')+' entry=$'+o.entryPx.toFixed(2)+
-           ' TP=$'+o.tp.toFixed(2)+' SL=$'+o.sl.toFixed(2)+
-           ' pnl='+(curNet>=0?'+':'')+'$'+curNet.toFixed(4)+
-           ' move='+movePct+'%'+(o.isPaper?' paper':' LIVE')+'\n';
+      var isLng=o.direction!=='SHORT';
+      var net2=isFutures?futFee(o.entryPx,px,o.margin||posSize,o.leverage||lev,isLng).net:feeMath(o.entryPx,px,o.amt||posSize).net;
+      var mv=((px-o.entryPx)/o.entryPx*100).toFixed(3);
+      p += 'pos['+i+']: '+(o.direction||'LONG')+' @$'+o.entryPx.toFixed(2)+' TP=$'+o.tp.toFixed(2)+' SL=$'+o.sl.toFixed(2)+' pnl='+(net2>=0?'+':'')+'$'+net2.toFixed(4)+' mv='+mv+'%'+(o.isPaper?' paper':' LIVE')+'\n';
     });
-    p += 'close_positions: array of pos indexes to CLOSE NOW. Empty=hold all.\n';
+    p += '\n';
   }
 
-  p += 'Rules:\n';
+  p += '=== RULES ===\n';
   if (isFutures) {
-    p += '- BUY: RSI<50, dip from high, bouncing up -> enter long\n';
-    p += '- SHORT: RSI>60, at recent high, EMA bearish -> enter short\n';
-    p += '- HOLD: sideways/unclear -> skip new entry\n';
-    p += '- Close open positions if market reversed against them\n';
-    p += '- Small profits target: tp_suggest 0.25-0.40%, sl_suggest 0.15-0.25%\n';
+    p += 'BUY (long) requires ALL: RSI14<45 AND dip<-0.05% AND ch1>0 AND (UPTREND OR AT_SUPPORT)\n';
+    p += 'SHORT requires ALL: RSI14>60 AND dip>-0.02% AND ch1<0 AND (DOWNTREND OR AT_RESISTANCE)\n';
+    p += 'HOLD if: RSI 45-60, SIDEWAYS trend, recent 2+ losses, vol<0.04%\n';
+    p += 'TP must be min '+(feeRT+0.15).toFixed(2)+'% | SL max 0.25% | TP at least 1.8x SL\n';
+    p += 'Best setup: tp=0.35% sl=0.18% = R:R 1.94x (need 34% winrate to profit)\n';
   } else {
-    p += '- BUY: RSI<50, bouncing from dip, EMA uptrend -> enter\n';
-    p += '- HOLD: RSI>65, falling -> skip\n';
-    p += '- Close open positions if market reversed against them\n';
+    p += 'BUY requires: RSI14<45 AND dip<-0.04% AND ch1>0 AND UPTREND\n';
+    p += 'HOLD if: RSI>60, falling, sideways, recent losses\n';
+    p += 'TP min '+(feeRT+0.15).toFixed(2)+'% | SL max 0.35%\n';
   }
-  p += '- If last 3 trades all losses: be conservative, HOLD\n';
-  p += 'Reply ONLY valid JSON: {"action":"BUY","confidence":75,"reason":"short reason","risk":"low","tp_suggest":0.35,"sl_suggest":0.20,"close_positions":[]}';
+  p += 'Close position if: market reversed hard against it OR small profit and risky\n';
+  p += 'GOLDEN RULE: HOLD when unsure. Miss a trade=$0. Bad trade=real loss.\n\n';
+  p += 'Reply ONLY with JSON (no text outside JSON):\n';
+  p += '{"action":"BUY","confidence":82,"reason":"RSI 38 at BB support bouncing","risk":"low","tp_suggest":0.35,"sl_suggest":0.18,"close_positions":[]}';
 
   return new Promise(resolve => {
     const body = JSON.stringify({
