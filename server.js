@@ -585,39 +585,55 @@ async function onFutTick(px) {
     return;
   }
 
-  // Call AI — it receives: price, RSI, EMA, BB, recent prices,
-  // trade history, win rate, open positions, capital
+  // Call AI — run every interval
   const decision = await callAI(px, true);
-  const dec = decision || S.aiFutDecision; // use cached if fresh call failed
-  if (!dec) {
-    if (futTicks % 30 === 0) log('FUT waiting for AI decision...', 'info');
+  const dec      = decision || S.aiFutDecision;
+  const decAge   = now - S.aiFutLastCall;
+
+  // ── FALLBACK: indicator-based entry when AI is silent or no trades yet ────
+  const minSinceEntry = (now - S.futLastEntry) / 60000;
+  const noTradesYet   = S.futT === 0 && S.futPapT === 0;
+  const aiSilent      = !dec || decAge > S.aiInterval * 3000;
+
+  if (aiSilent || noTradesYet && minSinceEntry > 5) {
+    const sig = getFutSig(px);
+    if (sig.signal) {
+      log('FUT INDICATOR entry (AI silent ' + Math.round(decAge/1000) + 's): ' + sig.reason, 'info');
+      if (papOpen < maxPos) futEnter(px, 'IND:'+sig.reason, true, 'BUY');
+      if (S.futMode==='live' && S.apiKey && S.apiSecret && liveOpen < maxPos)
+        futEnter(px, 'IND:'+sig.reason, false, 'BUY');
+      S.futLastEntry = now;
+    } else if (futTicks % 40 === 0) {
+      log('FUT: waiting for signal... RSI='+calcRSI((isFutures?futPX:PX.map(function(p){return p.px||p;})).filter(function(v){return v>0;}),14).toFixed(1), 'info');
+    }
     return;
   }
 
-  // AI decision age check — don't act on stale data (older than 2x interval)
-  const decAge = now - S.aiFutLastCall;
-  if (decAge > S.aiInterval * 2500) {
-    log('FUT AI decision stale (' + Math.round(decAge/1000) + 's old) — skipping', 'info');
-    return;
-  }
+  const action  = (dec.action || 'HOLD').toUpperCase();
+  const conf    = dec.confidence || 0;
+  const minConf = Math.max(55, S.aiMinConf || 60); // lower min confidence for futures
 
-  const action = (dec.action || 'HOLD').toUpperCase();
-  const conf   = dec.confidence || 0;
-  const minConf = S.aiMinConf || 65;
-
-  // Log AI status every 20 ticks
+  // Log every 20 ticks
   if (futTicks % 20 === 0) {
-    log('[FUT T'+futTicks+'] $'+px.toFixed(2)+' AI='+action+' conf='+conf+'% '+dec.reason, 'info');
+    log('[FUT T'+futTicks+'] $'+px.toFixed(2)+' AI='+action+' conf='+conf+'% | '+dec.reason, 'info');
   }
 
-  // AI says HOLD — don't trade
-  if (action === 'HOLD') return;
+  // AI HOLD with high confidence — skip
+  if (action === 'HOLD' && conf >= 70) return;
 
-  // AI confidence too low — skip
-  if (conf < minConf) {
-    if (futTicks % 20 === 0) log('FUT AI conf '+conf+'% < min '+minConf+'% — skipping', 'info');
+  // AI confidence below minimum — try indicator fallback
+  if (action === 'HOLD' || conf < minConf) {
+    const sig = getFutSig(px);
+    if (sig.signal && (minSinceEntry > 3 || noTradesYet)) {
+      log('FUT indicator override (AI HOLD conf='+conf+'%): '+sig.reason, 'info');
+      if (papOpen < maxPos) futEnter(px, 'IND:'+sig.reason, true, 'BUY');
+      if (S.futMode==='live' && S.apiKey && S.apiSecret && liveOpen < maxPos)
+        futEnter(px, 'IND:'+sig.reason, false, 'BUY');
+      S.futLastEntry = now;
+    }
     return;
   }
+
 
   // ── EXECUTE AI DECISION ──────────────────────────────────────────────────
   // BUY = open LONG position
@@ -766,22 +782,50 @@ async function callAI(px, isFutures) {
     p += '\n';
   }
 
-  p += '=== RULES ===\n';
+  // Time since last trade (to detect if AI is being too conservative)
+  var lastTradeAge = isFutures
+    ? (S.futT>0 ? Math.round((Date.now()-new Date(S.futTrades[0]&&S.futTrades[0].time?'2024-01-01T'+S.futTrades[0].time:0).getTime())/60000) : 999)
+    : 999;
+  var noTradeWarning = (S.futT===0 && isFutures) || lastTradeAge > 30;
+
+  p += '=== ENTRY SCORING (need 3+ out of 5 signals) ===\n';
   if (isFutures) {
-    p += 'BUY (long) requires ALL: RSI14<45 AND dip<-0.05% AND ch1>0 AND (UPTREND OR AT_SUPPORT)\n';
-    p += 'SHORT requires ALL: RSI14>60 AND dip>-0.02% AND ch1<0 AND (DOWNTREND OR AT_RESISTANCE)\n';
-    p += 'HOLD if: RSI 45-60, SIDEWAYS trend, recent 2+ losses, vol<0.04%\n';
-    p += 'TP must be min '+(feeRT+0.15).toFixed(2)+'% | SL max 0.25% | TP at least 1.8x SL\n';
-    p += 'Best setup: tp=0.35% sl=0.18% = R:R 1.94x (need 34% winrate to profit)\n';
+    p += 'Score each signal for BUY:\n';
+    p += '  [1] RSI14 < 50 = 1pt (current: '+r14.toFixed(1)+')\n';
+    p += '  [2] dip < -0.03% = 1pt (current: '+dip+'%)\n';
+    p += '  [3] ch1 > 0 OR ch5 > 0 = 1pt (ch1='+ch1+'% ch5='+ch5+'%)\n';
+    p += '  [4] EMA9 >= EMA21 (UPTREND or SIDEWAYS) = 1pt (trend='+trend+')\n';
+    p += '  [5] BB position = AT_SUPPORT or LOWER_HALF = 1pt (pos='+bbPos+')\n';
+    p += 'BUY if score >= 3. STRONG_BUY if score >= 4.\n\n';
+    p += 'Score each signal for SHORT:\n';
+    p += '  [1] RSI14 > 55 = 1pt\n';
+    p += '  [2] dip > -0.02% (near high) = 1pt\n';
+    p += '  [3] ch1 < 0 OR ch5 < 0 = 1pt\n';
+    p += '  [4] EMA9 < EMA21 (DOWNTREND or SIDEWAYS) = 1pt\n';
+    p += '  [5] BB position = AT_RESISTANCE or UPPER_HALF = 1pt\n';
+    p += 'SHORT if score >= 3.\n\n';
+    p += 'HOLD only if BOTH buy and short scores are below 3.\n';
   } else {
-    p += 'BUY requires: RSI14<45 AND dip<-0.04% AND ch1>0 AND UPTREND\n';
-    p += 'HOLD if: RSI>60, falling, sideways, recent losses\n';
-    p += 'TP min '+(feeRT+0.15).toFixed(2)+'% | SL max 0.35%\n';
+    p += 'BUY if 3+ of: RSI14<50, dip<-0.03%, ch1>0, EMA uptrend, BB at support\n';
+    p += 'HOLD if fewer than 3 signals\n';
   }
-  p += 'Close position if: market reversed hard against it OR small profit and risky\n';
-  p += 'GOLDEN RULE: HOLD when unsure. Miss a trade=$0. Bad trade=real loss.\n\n';
-  p += 'Reply ONLY with JSON (no text outside JSON):\n';
-  p += '{"action":"BUY","confidence":82,"reason":"RSI 38 at BB support bouncing","risk":"low","tp_suggest":0.35,"sl_suggest":0.18,"close_positions":[]}';
+  p += '\n=== TP/SL GUIDE ===\n';
+  p += 'Min TP = '+(feeRT+0.12).toFixed(2)+'% (fee '+feeRT+'% + min profit 0.12%)\n';
+  p += 'Good TP = 0.30-0.45% | Good SL = 0.15-0.22% | R:R must be >= 1.5x\n';
+  p += 'SCALPING mode: prefer small quick profits. tp=0.28% sl=0.15% is fine.\n';
+  if (noTradeWarning) {
+    p += '\n!!! IMPORTANT: No trades taken recently. If ANY 3 signals align, enter.\n';
+    p += 'Do not wait for perfect conditions. Scalping works on FREQUENCY.\n';
+    p += 'Even 60% confidence is enough to enter with correct TP/SL.\n';
+  }
+  if (recentLoss>=2) {
+    p += '\nCAUTION: Recent losses. Require 4+ signals before entering.\n';
+  }
+  p += '\nClose open positions if market moved against them or if small profit+risky.\n';
+  p += '\nReply ONLY with JSON:\n';
+  p += '{"action":"BUY","confidence":72,"reason":"RSI 44 dip -0.06% bouncing at BB support","risk":"low","tp_suggest":0.30,"sl_suggest":0.16,"close_positions":[]}\n';
+  p += 'Minimum confidence to enter: 60% (not 65+, we need frequent trades)\n';
+  p += 'NO text outside JSON. NO explanation. JSON only.';
 
   return new Promise(resolve => {
     const body = JSON.stringify({
