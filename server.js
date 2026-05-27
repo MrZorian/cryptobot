@@ -129,12 +129,15 @@ function stopFeed() {
   feedTimer = null;
 }
 
+// Coins to show on ticker bar + active trading pair
+const TICKER_COINS = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','DOGEUSDT','ADAUSDT','MATICUSDT'];
+let lastTickerFetch = 0;
+
 function fetchPrice() {
   const req = https.request({
     hostname: 'api.mexc.com',
     path: '/api/v3/ticker/price?symbol=' + S.pair,
-    method: 'GET',
-    timeout: 5000
+    method: 'GET', timeout: 5000
   }, res => {
     let d = '';
     res.on('data', c => d += c);
@@ -153,6 +156,49 @@ function fetchPrice() {
   req.on('error', () => {});
   req.on('timeout', () => req.destroy());
   req.end();
+
+  // Fetch all ticker prices every 5 seconds for the dashboard ticker bar
+  const now = Date.now();
+  if (now - lastTickerFetch < 5000) return;
+  lastTickerFetch = now;
+  const coins = [...new Set([...TICKER_COINS, S.pair])].join(',');
+  const tickReq = https.request({
+    hostname: 'api.mexc.com',
+    path: '/api/v3/ticker/price?symbols=["' + [...new Set([...TICKER_COINS, S.pair])].join('","') + '"]',
+    method: 'GET', timeout: 5000
+  }, res => {
+    let d = '';
+    res.on('data', c => d += c);
+    res.on('end', () => {
+      try {
+        const arr = JSON.parse(d);
+        if (Array.isArray(arr)) {
+          arr.forEach(t => {
+            const p = parseFloat(t.price||0);
+            if (p > 0) S.prices[t.symbol] = p;
+          });
+        }
+      } catch(e) {
+        // Fallback: fetch individually if batch fails
+        TICKER_COINS.forEach(sym => {
+          if (sym === S.pair) return; // already fetched above
+          const r2 = https.request({
+            hostname:'api.mexc.com', path:'/api/v3/ticker/price?symbol='+sym,
+            method:'GET', timeout:4000
+          }, res2 => {
+            let d2=''; res2.on('data',c=>d2+=c);
+            res2.on('end',()=>{
+              try{const j=JSON.parse(d2);if(j.price)S.prices[j.symbol]=parseFloat(j.price);}catch(e){}
+            });
+          });
+          r2.on('error',()=>{}); r2.on('timeout',()=>r2.destroy()); r2.end();
+        });
+      }
+    });
+  });
+  tickReq.on('error', () => {});
+  tickReq.on('timeout', () => tickReq.destroy());
+  tickReq.end();
 }
 
 // ── SPOT SIGNALS ──────────────────────────────────────────────────────────────
@@ -986,8 +1032,12 @@ const server = http.createServer((req, res) => {
     }
 
     if (url==='/closetrade') {
-      const o=(d.isPaper?S.papOrders:S.liveOrders).find(o=>o.id==d.id&&o.status==='open');
-      if(!o){send(res,404,{error:'Position not found'});return;}
+      const orders = d.isPaper ? S.papOrders : S.liveOrders;
+      const o = orders.find(o => String(o.id) === String(d.id) && o.status === 'open');
+      if (!o) {
+        log('Close failed: id='+d.id+' isPaper='+d.isPaper+' open orders: '+orders.filter(o=>o.status==='open').map(o=>o.id).join(','), 'err');
+        send(res,404,{error:'Position not found. ID='+d.id}); return;
+      }
       const px=S.lastPx;
       const{net,fee,gross}=feeMath(o.entryPx,px,o.amt);
       o.status='closed';
@@ -999,17 +1049,43 @@ const server = http.createServer((req, res) => {
     }
 
     if (url==='/closefuttrade') {
-      const o=(d.isPaper?S.futPapOrders:S.futOrders).find(o=>o.id==d.id&&o.status==='open');
-      if(!o){send(res,404,{error:'Futures position not found'});return;}
-      const px=S.futLastPx||S.lastPx;
-      const{net,fee,pnl}=futFee(o.entryPx,px,o.margin,o.leverage);
-      o.status='closed';
-      const movePct=((px-o.entryPx)/o.entryPx*100).toFixed(3);
-      const tr={n:d.isPaper?++S.futPapT:++S.futT,time:new Date().toISOString().slice(11,19),pair:S.futPair,direction:'LONG',isPaper:d.isPaper,side:'MANUAL',entryPx:o.entryPx,exitPx:px,margin:o.margin,leverage:o.leverage,notional:o.notional,move:movePct+'%',leveragedMove:(parseFloat(movePct)*o.leverage).toFixed(3)+'%',fee:+fee.toFixed(6),pnl:+pnl.toFixed(6),net:+net.toFixed(6)};
-      if(d.isPaper){S.futPapProfit+=net;S.futFees+=fee;if(net>=0)S.futPapW++;else S.futPapL++;S.futPapTrades.unshift(tr);S.futPapOrders=S.futPapOrders.filter(o=>o.status==='open');}
-      else{S.futProfit+=net;S.futFees+=fee;if(net>=0){S.futW++;if(net>S.futBest)S.futBest=net;}else S.futL++;S.futTrades.unshift(tr);S.futOrders=S.futOrders.filter(o=>o.status==='open');futPlaceOrder('close_long',o.margin,o.leverage,px);}
-      log('MANUAL CLOSE fut @ $'+px.toFixed(2)+' NET='+(net>=0?'+':'')+'$'+net.toFixed(4),'info');
-      save(); send(res,200,{ok:true,net,fee,exitPx:px}); return;
+      const orders = d.isPaper ? S.futPapOrders : S.futOrders;
+      const o = orders.find(o => o.id == d.id && o.status === 'open');
+      if (!o) { send(res,404,{error:'Futures position not found. May already be closed.'}); return; }
+      const px      = S.futLastPx || S.lastPx;
+      const isLng   = o.direction !== 'SHORT';
+      const {net,fee,pnl} = futFee(o.entryPx, px, o.margin, o.leverage, isLng);
+      o.status = 'closed';
+      const movePct = ((px - o.entryPx) / o.entryPx * 100).toFixed(3);
+      const levMove = (parseFloat(movePct) * o.leverage).toFixed(3);
+      const tr = {
+        n: d.isPaper ? ++S.futPapT : ++S.futT,
+        time: new Date().toISOString().slice(11,19),
+        pair: S.futPair, direction: o.direction||'LONG',
+        isPaper: d.isPaper, side: 'MANUAL',
+        entryPx: o.entryPx, exitPx: px,
+        margin: o.margin, leverage: o.leverage, notional: o.notional,
+        move: movePct+'%', leveragedMove: levMove+'%',
+        fee: +fee.toFixed(6), pnl: +pnl.toFixed(6), net: +net.toFixed(6)
+      };
+      if (d.isPaper) {
+        S.futPapProfit += net; S.futFees += fee;
+        if (net >= 0) S.futPapW++; else S.futPapL++;
+        S.futPapTrades.unshift(tr);
+        S.futPapOrders = S.futPapOrders.filter(o => o.status === 'open');
+      } else {
+        S.futProfit += net; S.futFees += fee;
+        if (net >= 0) { S.futW++; if (net > S.futBest) S.futBest = net; } else S.futL++;
+        S.futTrades.unshift(tr);
+        S.futOrders = S.futOrders.filter(o => o.status === 'open');
+        // Close the correct direction on MEXC
+        const closeAction = isLng ? 'close_long' : 'close_short';
+        futPlaceOrder(closeAction, o.margin, o.leverage, px);
+      }
+      log('MANUAL CLOSE fut '+o.direction+' @ $'+px.toFixed(2)+' NET='+(net>=0?'+':'')+'$'+net.toFixed(4), net>=0?'profit':'info');
+      save();
+      send(res, 200, {ok:true, net, fee, exitPx:px, direction:o.direction});
+      return;
     }
 
     send(res,404,{error:'Not found: '+url});
