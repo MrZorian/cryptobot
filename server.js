@@ -431,9 +431,15 @@ function getFutSig(px) {
 
 // ── FUTURES ENTRY — supports LONG and SHORT ───────────────────────────────────
 function futEnter(px, reason, isPaper, direction) {
+  // RECOVERY MODE: reduce position size after 3+ consecutive losses
+  var lossStreak = 0;
+  var trades = isPaper ? (S.futPapTrades||[]) : S.futTrades;
+  for (var li=0; li<trades.length; li++) { if(trades[li].net<0) lossStreak++; else break; }
+  var sizeMultiplier = lossStreak >= 3 ? 0.5 : lossStreak >= 2 ? 0.75 : 1.0;
+  if (lossStreak >= 2) log('RECOVERY x'+sizeMultiplier+' size ('+lossStreak+' losses)', 'info');
   direction = direction || 'BUY'; // 'BUY'=long, 'SHORT'=short
   const isLong   = direction !== 'SHORT';
-  const margin   = S.futCapital / S.futMaxPos;
+  const margin   = (S.futCapital / S.futMaxPos) * sizeMultiplier;
   const lev      = S.futLeverage;
   const notional = margin * lev;
   const bePx     = parseFloat(futBE(px, margin, lev, isLong).toFixed(4));
@@ -611,7 +617,7 @@ async function onFutTick(px) {
 
   const action  = (dec.action || 'HOLD').toUpperCase();
   const conf    = dec.confidence || 0;
-  const minConf = Math.max(55, S.aiMinConf || 60); // lower min confidence for futures
+  const minConf = S.aiMinConf > 0 ? Math.min(S.aiMinConf, 65) : 58; // professional: 58% min
 
   // Log every 20 ticks
   if (futTicks % 20 === 0) {
@@ -750,82 +756,142 @@ async function callAI(px, isFutures) {
     ? S.futOrders.concat(S.futPapOrders)
     : S.liveOrders.concat(S.papOrders)).filter(function(o){return o.status==='open';});
 
-  var p = '';
-  p += '=== CRYPTO TRADING AGENT ===\n';
-  p += 'You manage REAL money. Every bad trade = real loss. Be SELECTIVE.\n\n';
-  p += '=== ACCOUNT ===\n';
-  p += 'Capital: $'+cap+' | Per-pos: $'+posSize.toFixed(2);
-  if (isFutures) p += ' x'+lev+'lev = $'+notional.toFixed(2)+' notional';
-  p += '\n';
-  p += 'Total P&L: $'+profit.toFixed(4)+' | Win rate: '+wr+'% ('+wins+'/'+totalT+')\n';
-  p += 'Last 5 net sum: $'+last5net.toFixed(4)+(last5net<0?' LOSING':'  profitable')+'\n';
-  p += 'Live trades: '+tradeStr+'\n';
-  p += 'Paper trades: '+papStr+'\n';
-  if (recentLoss>=2) p += 'WARNING: '+recentLoss+'/3 recent trades LOST. Be very conservative.\n';
-  p += '\n=== MARKET ('+( isFutures?S.futPair+' FUT':S.pair+' SPOT')+') ===\n';
-  p += 'Price: $'+px.toFixed(2)+' | Trend: '+trend+'\n';
-  p += 'RSI14: '+r14.toFixed(1)+' RSI9: '+r9.toFixed(1)+'\n';
-  p += 'EMA9: $'+e9.toFixed(2)+' EMA21: $'+e21.toFixed(2)+'\n';
-  if (bb) p += 'BB: low=$'+bb.lower.toFixed(2)+' mid=$'+bb.middle.toFixed(2)+' hi=$'+bb.upper.toFixed(2)+' pos='+bbPos+'\n';
-  p += 'Dip: '+dip+'% | ch1: '+ch1+'% | ch5: '+ch5+'% | vol: '+vol+'%\n';
-  p += 'Recent prices: '+recentPx+'\n';
-  p += 'Fee RT: '+feeRT+'%\n\n';
+  // ══════════════════════════════════════════════════════════════════════
+  // PROFESSIONAL TRADING PROMPT — Senior Trader Framework
+  // Strategy: Scalp pullbacks in trend direction. Target 60%+ win rate.
+  // Math: TP=0.30% SL=0.16% after 0.04% fee = net +0.26% / -0.20% = 1.3:1 R:R
+  //       At 60% win rate: 0.6×0.26 - 0.4×0.20 = +0.076% per trade
+  //       50 trades/day on $60 notional = $2.28/day on $20 margin = 11.4%/day
+  // ══════════════════════════════════════════════════════════════════════
 
-  if (openPos.length>0) {
-    p += '=== OPEN POSITIONS ===\n';
+  // Detect RSI direction (rising or falling)
+  var rsiRising = false, rsiFalling = false;
+  if (n > 5) {
+    var r14prev = calcRSI(raw.slice(0,-3), Math.min(14,n-4));
+    rsiRising  = r14 > r14prev + 0.5;
+    rsiFalling = r14 < r14prev - 0.5;
+  }
+
+  // Detect BB width (volatility) - wide = active market, narrow = dead
+  var bbWidth = bb ? ((bb.upper - bb.lower) / bb.middle * 100).toFixed(3) : '0';
+  var marketActive = parseFloat(bbWidth) > 0.08; // min 0.08% range to trade
+
+  // Detect if price is near round number ($77000, $78000 etc) - key S/R
+  var roundNum = Math.round(px / 100) * 100;
+  var nearRound = Math.abs(px - roundNum) / px < 0.001; // within 0.1% of round
+
+  // EMA50 for trend direction (use available data)
+  var e50 = n>=50 ? calcEMA(raw, 50) : e21;
+  var bigTrend = px > e50 ? 'BULLISH' : 'BEARISH';
+
+  // Momentum: count consecutive up/down ticks
+  var upTicks = 0, downTicks = 0;
+  for (var ti = n-1; ti >= Math.max(0,n-5); ti--) {
+    if (raw[ti] > raw[ti-1]) upTicks++;
+    else if (raw[ti] < raw[ti-1]) downTicks++;
+    else break;
+  }
+
+  // Loss streak for position sizing
+  var lossStreak  = 0;
+  for (var li=0; li<allTrades.length; li++) {
+    if (allTrades[li].net < 0) lossStreak++;
+    else break;
+  }
+
+  // Mode: RECOVERY (after losses) or NORMAL or AGGRESSIVE (after wins)
+  var mode = lossStreak >= 3 ? 'RECOVERY' : last5net > 0 && wr >= 60 ? 'NORMAL' : 'NORMAL';
+
+  var p = '';
+  p += 'ROLE: You are a professional crypto scalp trader with 10 years experience.\n';
+  p += 'GOAL: Consistent small profits that compound. Protect capital above all.\n\n';
+
+  // ── ACCOUNT STATE ──
+  p += 'ACCOUNT:\n';
+  p += '  Balance P&L: $'+profit.toFixed(4)+' | Mode: '+mode+'\n';
+  p += '  Win rate: '+wr+'% over '+totalT+' trades (target: 60%+)\n';
+  p += '  Loss streak: '+lossStreak+' | Last 5 net: $'+last5net.toFixed(4)+'\n';
+  p += '  Position: $'+posSize.toFixed(2)+' margin';
+  if (isFutures) p += ' x'+lev+'x = $'+notional.toFixed(2)+' notional';
+  p += ' | Fee: '+feeRT+'% RT\n';
+  p += '  Recent: '+tradeStr+'\n\n';
+
+  // ── MARKET ANALYSIS ──
+  p += 'MARKET ANALYSIS ('+( isFutures?S.futPair+' PERP '+lev+'x':S.pair+' SPOT')+'):\n';
+  p += '  Price: $'+px.toFixed(2)+'\n';
+  p += '  BIG TREND (EMA50): '+bigTrend+' | Short trend: '+trend+'\n';
+  p += '  RSI-14: '+r14.toFixed(1)+(rsiRising?' RISING':rsiFalling?' FALLING':' FLAT')+'\n';
+  p += '  RSI-9: '+r9.toFixed(1)+' | EMA9: $'+e9.toFixed(2)+' vs EMA21: $'+e21.toFixed(2)+'\n';
+  if (bb) {
+    p += '  Bollinger: L=$'+bb.lower.toFixed(2)+' M=$'+bb.middle.toFixed(2)+' U=$'+bb.upper.toFixed(2)+'\n';
+    p += '  BB Width: '+bbWidth+'% ('+( marketActive?'ACTIVE market':'DEAD market - avoid')+') | Position: '+bbPos+'\n';
+  }
+  p += '  Momentum: ch1='+ch1+'% ch5='+ch5+'% | UpTicks='+upTicks+' DownTicks='+downTicks+'\n';
+  p += '  Dip from high: '+dip+'% | Volatility: '+vol+'%\n';
+  p += '  Round number $'+roundNum+': '+(nearRound?'YES - key S/R level':'no')+'\n';
+  p += '  Prices: '+recentPx+'\n\n';
+
+  // ── OPEN POSITIONS ──
+  if (openPos.length > 0) {
+    p += 'OPEN POSITIONS:\n';
     openPos.forEach(function(o,i) {
-      var isLng=o.direction!=='SHORT';
-      var net2=isFutures?futFee(o.entryPx,px,o.margin||posSize,o.leverage||lev,isLng).net:feeMath(o.entryPx,px,o.amt||posSize).net;
-      var mv=((px-o.entryPx)/o.entryPx*100).toFixed(3);
-      p += 'pos['+i+']: '+(o.direction||'LONG')+' @$'+o.entryPx.toFixed(2)+' TP=$'+o.tp.toFixed(2)+' SL=$'+o.sl.toFixed(2)+' pnl='+(net2>=0?'+':'')+'$'+net2.toFixed(4)+' mv='+mv+'%'+(o.isPaper?' paper':' LIVE')+'\n';
+      var isLng = o.direction !== 'SHORT';
+      var curNet = isFutures ? futFee(o.entryPx,px,o.margin||posSize,o.leverage||lev,isLng).net : feeMath(o.entryPx,px,o.amt||posSize).net;
+      var mv = ((px-o.entryPx)/o.entryPx*100).toFixed(3);
+      var pctToTP = o.tp !== o.sl ? ((px-o.entryPx)/(o.tp-o.entryPx)*100).toFixed(0) : '?';
+      p += '  ['+i+'] '+(o.direction||'LONG')+' @$'+o.entryPx.toFixed(2)+
+           ' TP=$'+o.tp.toFixed(2)+' SL=$'+o.sl.toFixed(2)+
+           ' | P&L='+(curNet>=0?'+':'')+'$'+curNet.toFixed(4)+' ('+mv+'%, '+pctToTP+'% to TP)'+
+           (o.isPaper?' [paper]':' [LIVE]')+'\n';
     });
     p += '\n';
   }
 
-  // Time since last trade (to detect if AI is being too conservative)
-  var lastTradeAge = isFutures
-    ? (S.futT>0 ? Math.round((Date.now()-new Date(S.futTrades[0]&&S.futTrades[0].time?'2024-01-01T'+S.futTrades[0].time:0).getTime())/60000) : 999)
-    : 999;
-  var noTradeWarning = (S.futT===0 && isFutures) || lastTradeAge > 30;
-
-  p += '=== ENTRY SCORING (need 3+ out of 5 signals) ===\n';
+  // ── PROFESSIONAL STRATEGY ──
+  p += 'STRATEGY (Pullback Scalping in Trend Direction):\n\n';
   if (isFutures) {
-    p += 'Score each signal for BUY:\n';
-    p += '  [1] RSI14 < 50 = 1pt (current: '+r14.toFixed(1)+')\n';
-    p += '  [2] dip < -0.03% = 1pt (current: '+dip+'%)\n';
-    p += '  [3] ch1 > 0 OR ch5 > 0 = 1pt (ch1='+ch1+'% ch5='+ch5+'%)\n';
-    p += '  [4] EMA9 >= EMA21 (UPTREND or SIDEWAYS) = 1pt (trend='+trend+')\n';
-    p += '  [5] BB position = AT_SUPPORT or LOWER_HALF = 1pt (pos='+bbPos+')\n';
-    p += 'BUY if score >= 3. STRONG_BUY if score >= 4.\n\n';
-    p += 'Score each signal for SHORT:\n';
-    p += '  [1] RSI14 > 55 = 1pt\n';
-    p += '  [2] dip > -0.02% (near high) = 1pt\n';
-    p += '  [3] ch1 < 0 OR ch5 < 0 = 1pt\n';
-    p += '  [4] EMA9 < EMA21 (DOWNTREND or SIDEWAYS) = 1pt\n';
-    p += '  [5] BB position = AT_RESISTANCE or UPPER_HALF = 1pt\n';
-    p += 'SHORT if score >= 3.\n\n';
-    p += 'HOLD only if BOTH buy and short scores are below 3.\n';
+    p += 'LONG SETUP (buy the dip in uptrend):\n';
+    p += '  Required: RSI14 < 52 AND RSI RISING/FLAT AND dip < -0.03%\n';
+    p += '  Confirm:  ch1 > 0 (price turning up) AND (AT_SUPPORT OR LOWER_HALF OR bigTrend=BULLISH)\n';
+    p += '  Strong:   RSI14 < 45 = high priority. At BB lower = excellent entry.\n';
+    p += '  Avoid:    RSI14 > 58, price at BB upper, momentum falling (upTicks=0)\n\n';
+    p += 'SHORT SETUP (fade the rally in downtrend):\n';
+    p += '  Required: RSI14 > 52 AND RSI FALLING/FLAT AND dip > -0.02% (near high)\n';
+    p += '  Confirm:  ch1 < 0 (price turning down) AND (AT_RESISTANCE OR UPPER_HALF OR bigTrend=BEARISH)\n';
+    p += '  Strong:   RSI14 > 60 = high priority. At BB upper = excellent entry.\n';
+    p += '  Avoid:    RSI14 < 45, price at BB lower, momentum rising (downTicks=0)\n\n';
+    p += 'DEAD MARKET RULE: If BB width < 0.06% = HOLD (no volatility = fees eat profits)\n\n';
   } else {
-    p += 'BUY if 3+ of: RSI14<50, dip<-0.03%, ch1>0, EMA uptrend, BB at support\n';
-    p += 'HOLD if fewer than 3 signals\n';
+    p += 'BUY: RSI14<50 + RSI rising + dip<-0.03% + ch1>0 + (AT_SUPPORT or LOWER_HALF)\n';
+    p += 'HOLD: RSI>60 or falling or no momentum\n\n';
   }
-  p += '\n=== TP/SL GUIDE ===\n';
-  p += 'Min TP = '+(feeRT+0.12).toFixed(2)+'% (fee '+feeRT+'% + min profit 0.12%)\n';
-  p += 'Good TP = 0.30-0.45% | Good SL = 0.15-0.22% | R:R must be >= 1.5x\n';
-  p += 'SCALPING mode: prefer small quick profits. tp=0.28% sl=0.15% is fine.\n';
-  if (noTradeWarning) {
-    p += '\n!!! IMPORTANT: No trades taken recently. If ANY 3 signals align, enter.\n';
-    p += 'Do not wait for perfect conditions. Scalping works on FREQUENCY.\n';
-    p += 'Even 60% confidence is enough to enter with correct TP/SL.\n';
+
+  p += 'TP/SL PROFESSIONAL SIZING:\n';
+  p += '  Scalp (normal):  TP=0.28% SL=0.15% = R:R 1.9x — need 35% winrate\n';
+  p += '  Standard:        TP=0.35% SL=0.18% = R:R 1.9x — need 35% winrate\n';
+  p += '  Momentum (fast): TP=0.20% SL=0.12% = R:R 1.7x — quick in/out\n';
+  p += '  Fee='+feeRT+'% RT. Min TP='+(feeRT+0.10).toFixed(2)+'% to profit after fees.\n\n';
+
+  p += 'POSITION MANAGEMENT:\n';
+  if (lossStreak >= 3) {
+    p += '  RECOVERY MODE: '+lossStreak+' straight losses. Use tight SL=0.12%, small TP=0.20%. Rebuild slowly.\n';
+  } else if (wr >= 65 && totalT >= 10) {
+    p += '  WINNING: '+wr+'% win rate. Stay consistent. Do not widen SL.\n';
   }
-  if (recentLoss>=2) {
-    p += '\nCAUTION: Recent losses. Require 4+ signals before entering.\n';
-  }
-  p += '\nClose open positions if market moved against them or if small profit+risky.\n';
-  p += '\nReply ONLY with JSON:\n';
-  p += '{"action":"BUY","confidence":72,"reason":"RSI 44 dip -0.06% bouncing at BB support","risk":"low","tp_suggest":0.30,"sl_suggest":0.16,"close_positions":[]}\n';
-  p += 'Minimum confidence to enter: 60% (not 65+, we need frequent trades)\n';
-  p += 'NO text outside JSON. NO explanation. JSON only.';
+  p += '  CLOSE position early if: momentum fully reversed AND position losing AND no sign of recovery.\n';
+  p += '  HOLD position if: slight drawdown but trend intact (normal pullback within SL).\n\n';
+
+  p += 'FREQUENCY TARGET: 20-50 trades/day for consistent compounding.\n';
+  p += 'Do not be too selective. If 3+ signals align = ENTER. Consistency beats perfection.\n\n';
+
+  p += 'JSON RESPONSE (no text outside JSON):\n';
+  p += '{"action":"BUY","confidence":75,"reason":"RSI 44 rising, dip -0.08% bouncing, at BB support","risk":"low","tp_suggest":0.30,"sl_suggest":0.16,"close_positions":[]}\n';
+  p += 'action: BUY | SHORT | HOLD\n';
+  p += 'confidence: 55-100. Enter at 58+. Strong signal = 75+.\n';
+  p += 'tp_suggest: your exact TP % recommendation\n';
+  p += 'sl_suggest: your exact SL % recommendation (max 0.25)\n';
+  p += 'close_positions: position indexes to close [0,1] or []\n';
+  p += 'reason: max 10 words describing the setup\n';
 
   return new Promise(resolve => {
     const body = JSON.stringify({
