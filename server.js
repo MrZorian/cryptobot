@@ -40,7 +40,7 @@ let S = {
   futProfit:0, futT:0, futW:0, futL:0, futBest:0, futFees:0,
   futPapProfit:0, futPapT:0, futPapW:0, futPapL:0,
   futOrders:[], futPapOrders:[], futTrades:[], futPapTrades:[],
-  futLastPx:0, futLastEntry:0,
+  futLastPx:0, futLastEntry:0, futCooldown:6000,
   // CRT Engine
   crtCandleSize:40, crtCandles:[], crtCurrentCandle:null,
   crtLastSignal:null, crtStats:{setups:0,confirmed:0,entered:0},
@@ -443,7 +443,7 @@ async function onFutTick(px){
   futExitCheck(px,false);       // check live exits
   if(futTicks<5)return;
   var now=Date.now();
-  if(now-S.futLastEntry<S.futCooldown||6000)return;
+  if(now-S.futLastEntry<(S.futCooldown||6000))return;
   var papOpen=S.futPapOrders.filter(function(o){return o.status==='open';}).length;
   var liveOpen=S.futOrders.filter(function(o){return o.status==='open';}).length;
   if(papOpen>=S.futMaxPos&&liveOpen>=S.futMaxPos)return;
@@ -759,6 +759,72 @@ const server=http.createServer(function(req,res){
         else S.futOrders=S.futOrders.filter(function(o){return o.status==='open';});
         save();send(res,200,{ok:true});return;
       }
+
+      // ── SAVE API KEYS ──────────────────────────────────────────────────────
+      if(url==='/savekeys'){
+        if(!d.apiKey||!d.apiSecret){send(res,400,{error:'apiKey and apiSecret required'});return;}
+        S.apiKey=d.apiKey.trim(); S.apiSecret=d.apiSecret.trim();
+        saveKeys(S.apiKey,S.apiSecret); save();
+        log('API keys saved key='+S.apiKey.length+'chars secret='+S.apiSecret.length+'chars','info');
+        var tsT=Date.now().toString(),qsT='timestamp='+tsT+'&recvWindow=5000';
+        var sigT=crypto.createHmac('sha256',S.apiSecret).update(qsT).digest('hex');
+        var tReq=https.request({hostname:'api.mexc.com',path:'/api/v3/account?'+qsT+'&signature='+sigT,method:'GET',headers:{'X-MEXC-APIKEY':S.apiKey},timeout:6000},function(r2){var d2='';r2.on('data',function(c){d2+=c;});r2.on('end',function(){try{var rx=JSON.parse(d2);if(rx.balances)log('MEXC KEYS VERIFIED! Balances accessible.','profit');else log('Key test: '+JSON.stringify(rx).slice(0,80),'info');}catch(e){}});});
+        tReq.on('error',function(){}); tReq.on('timeout',function(){tReq.destroy();}); tReq.end();
+        send(res,200,{ok:true,keyLength:S.apiKey.length,secLength:S.apiSecret.length}); return;
+      }
+      // ── MODE SWITCH ────────────────────────────────────────────────────────
+      if(url==='/setlive'){S.mode='live';save();log('Mode LIVE — real orders!','buy');send(res,200,{ok:true,mode:'live'});return;}
+      if(url==='/setpaper'){S.mode='paper';save();log('Mode PAPER — simulation.','info');send(res,200,{ok:true,mode:'paper'});return;}
+      // ── TEST CONNECTION ────────────────────────────────────────────────────
+      if(url==='/testconnection'){
+        if(!S.apiKey||!S.apiSecret){send(res,200,{ok:false,error:'No API keys saved'});return;}
+        var tsX=Date.now().toString(),qsX='timestamp='+tsX+'&recvWindow=5000';
+        var sigX=crypto.createHmac('sha256',S.apiSecret).update(qsX).digest('hex');
+        var xReq=https.request({hostname:'api.mexc.com',path:'/api/v3/account?'+qsX+'&signature='+sigX,method:'GET',headers:{'X-MEXC-APIKEY':S.apiKey},timeout:6000},function(rX){var dx='';rX.on('data',function(c){dx+=c;});rX.on('end',function(){try{var rx=JSON.parse(dx);if(rx.balances){var u=rx.balances.find(function(b){return b.asset==='USDT';});send(res,200,{ok:true,balance:u?parseFloat(u.free):0,msg:'Connected!'});}else send(res,200,{ok:false,error:rx.msg||'Check keys'});}catch(e){send(res,200,{ok:false,error:'parse err'});}});});
+        xReq.on('error',function(e){send(res,200,{ok:false,error:e.message});});
+        xReq.on('timeout',function(){xReq.destroy();send(res,200,{ok:false,error:'timeout'});});
+        xReq.end(); return;
+      }
+      // ── SPOT BALANCE ───────────────────────────────────────────────────────
+      if(url==='/balance'){
+        if(!S.apiKey||!S.apiSecret){send(res,200,{ok:false,error:'No API keys'});return;}
+        var tsB=Date.now().toString(),qsB='timestamp='+tsB+'&recvWindow=5000';
+        var sigB=crypto.createHmac('sha256',S.apiSecret).update(qsB).digest('hex');
+        var bReq=https.request({hostname:'api.mexc.com',path:'/api/v3/account?'+qsB+'&signature='+sigB,method:'GET',headers:{'X-MEXC-APIKEY':S.apiKey},timeout:6000},function(rB){var dB='';rB.on('data',function(c){dB+=c;});rB.on('end',function(){try{var rb=JSON.parse(dB);if(rb.balances){var coins=['USDT','BTC','ETH','BNB','SOL'],result={};rb.balances.forEach(function(b){if(coins.includes(b.asset))result[b.asset]=parseFloat(b.free);});S.mexcBalance=result;save();send(res,200,{ok:true,balance:result});}else send(res,200,{ok:false,error:rb.msg||'unknown'});}catch(e){send(res,200,{ok:false,error:'parse err'});}});});
+        bReq.on('error',function(e){send(res,200,{ok:false,error:e.message});});
+        bReq.on('timeout',function(){bReq.destroy();send(res,200,{ok:false,error:'timeout'});});
+        bReq.end(); return;
+      }
+      // ── FUTURES BALANCE ────────────────────────────────────────────────────
+      if(url==='/futuresbalance'){
+        if(!S.apiKey||!S.apiSecret){send(res,200,{ok:false,error:'No API keys'});return;}
+        var tsFB=Date.now().toString(),bodyFB='';
+        var sigFB=crypto.createHmac('sha256',S.apiSecret).update(S.apiKey+tsFB+bodyFB).digest('hex');
+        var fbReq=https.request({hostname:'contract.mexc.com',path:'/api/v1/private/account/assets',method:'GET',headers:{'ApiKey':S.apiKey,'Request-Time':tsFB,'Signature':sigFB,'Content-Type':'application/json'},timeout:6000},function(rFB){var dFB='';rFB.on('data',function(c){dFB+=c;});rFB.on('end',function(){try{var rfb=JSON.parse(dFB);if(rfb.success&&rfb.data){var u2=Array.isArray(rfb.data)?rfb.data.find(function(a){return a.currency==='USDT';}):null;send(res,200,{ok:true,balance:u2?parseFloat(u2.availableBalance):0});}else send(res,200,{ok:false,error:'check futures wallet'});}catch(e){send(res,200,{ok:false,error:'parse err'});}});});
+        fbReq.on('error',function(e){send(res,200,{ok:false,error:e.message});});
+        fbReq.on('timeout',function(){fbReq.destroy();send(res,200,{ok:false,error:'timeout'});});
+        fbReq.end(); return;
+      }
+      // ── FUTURES CONFIG ─────────────────────────────────────────────────────
+      if(url==='/configfutures'){
+        if(d.futPair)    S.futPair    = d.futPair;
+        if(d.futMode)    S.futMode    = d.futMode;
+        if(d.futCapital) S.futCapital = parseFloat(d.futCapital)||20;
+        if(d.futMaxPos)  S.futMaxPos  = parseInt(d.futMaxPos)||1;
+        if(d.futLeverage)S.futLeverage= parseInt(d.futLeverage)||3;
+        if(d.futTpPct)   S.futTpPct   = parseFloat(d.futTpPct)||0.45;
+        if(d.futSlPct)   S.futSlPct   = parseFloat(d.futSlPct)||0.20;
+        if(d.futCooldown)S.futCooldown= parseInt(d.futCooldown)*1000||6000;
+        if(d.candleSize) S.crtCandleSize=parseInt(d.candleSize)||40;
+        save();
+        log('Futures CRT config: '+S.futPair+' '+S.futLeverage+'x $'+S.futCapital+' candle='+S.crtCandleSize+'ticks','info');
+        send(res,200,{ok:true,futTpPct:S.futTpPct,futSlPct:S.futSlPct,posMargin:S.futCapital/S.futMaxPos,notional:(S.futCapital/S.futMaxPos)*S.futLeverage});
+        return;
+      }
+      // ── AI DECISION ────────────────────────────────────────────────────────
+      if(url==='/aidecision'){send(res,200,{ok:true,decision:S.aiFutDecision,futDecision:S.aiFutDecision});return;}
+      // ── RESET PAPER ────────────────────────────────────────────────────────
+      if(url==='/resetpaper'){S.papProfit=0;S.papT=0;S.papW=0;S.papL=0;S.papBest=0;S.papFees=0;S.papTrades=[];S.papOrders=[];save();send(res,200,{ok:true});return;}
       send(res,404,{error:'Not found'});
     });
     return;
