@@ -189,56 +189,50 @@ function crtDetect(px){
   if(S.crtCandles.length<2)return null;
   var prev=S.crtCandles[0],curr=S.crtCurrentCandle;
   if(!prev||!curr)return null;
-  var prevRange=prev.h-prev.l,prevRangePct=prevRange/prev.l*100;
-  if(prevRangePct<0.06)return null; // candle too small — skip
-  var sweepBuf=prev.c*0.00015; // 0.015% buffer beyond prev H/L
+  var prevRange=prev.h-prev.l, prevRangePct=prevRange/prev.l*100;
 
-  // ── BULLISH CRT: swept BELOW prev.low → rejected BACK ABOVE ──────────────
-  if(curr.l<prev.l-sweepBuf && px>prev.l){
-    var sweepDepth=(prev.l-curr.l)/prev.l*100;
-    var tp=parseFloat(prev.h.toFixed(4));           // TP = prev candle HIGH
-    var sl=parseFloat((curr.l*0.9995).toFixed(4));  // SL = just below sweep
-    var tpDist=(tp-px)/px*100, slDist=(px-sl)/px*100;
-    var rr=slDist>0?tpDist/slDist:0;
-    if(tpDist<FUT_RT*100+0.10)return null;
-    if(rr<1.2)return null;
-    if(sweepDepth<0.008)return null;
+  // Adaptive thresholds — work for both 1-min (small) and 4-min (large) BTC candles
+  // Thresholds tuned for BTC 1-min candles (range typically 0.02-0.08%)
+  var minRange = 0.015;              // 0.015% min range (~$15 on BTC)
+  var minSweep = 0.002;              // 0.002% min sweep depth (~$2 on BTC)
+  var minRR    = 0.8;                // min R:R 0.8 — CRT's high win rate compensates
+  var minTP    = FUT_RT*100;          // min TP = just cover fees (0.04%) — R:R handles quality
+  var sweepBuf = Math.max(prevRange*0.10, prev.l*0.00008); // 10% of range OR 0.008% of price
+
+  if(prevRangePct < minRange) return null;
+
+  // BULLISH CRT: current candle swept BELOW prev.low, price now back ABOVE prev.low
+  if(curr.l < prev.l-sweepBuf && px > prev.l){
+    var sweepD=(prev.l-curr.l)/prev.l*100;
+    if(sweepD<minSweep)return null;
+    var tp=parseFloat(prev.h.toFixed(4));
+    var sl=parseFloat((curr.l-(sweepBuf*0.3)).toFixed(4));
+    var tpD=(tp-px)/px*100, slD=(px-sl)/px*100;
+    var rr=slD>0?tpD/slD:0;
+    if(tpD<minTP||rr<minRR)return null;
     S.crtStats.setups++;
-    return {
-      direction:'BUY', type:'BULLISH_CRT',
-      sweepLevel:prev.l, sweepLow:curr.l, sweepHigh:null,
-      sweepDepth:sweepDepth.toFixed(4),
-      entry:px, tp:tp, sl:sl,
-      tpPct:parseFloat(tpDist.toFixed(4)),
-      slPct:parseFloat(slDist.toFixed(4)),
-      rr:parseFloat(rr.toFixed(2)),
+    return {direction:'BUY',type:'BULLISH_CRT',sweepLevel:prev.l,sweepLow:curr.l,sweepHigh:null,
+      sweepDepth:sweepD.toFixed(4),entry:px,tp:tp,sl:sl,
+      tpPct:parseFloat(tpD.toFixed(4)),slPct:parseFloat(slD.toFixed(4)),rr:parseFloat(rr.toFixed(2)),
       prevRange:prevRangePct.toFixed(4),
-      reason:'Bullish CRT: swept $'+curr.l.toFixed(2)+' below prev.lo $'+prev.l.toFixed(2)+' R:R='+rr.toFixed(2)
-    };
+      reason:'Bullish CRT: swept $'+curr.l.toFixed(2)+' below prev.lo $'+prev.l.toFixed(2)+' R:R='+rr.toFixed(2)+'x range='+prevRangePct.toFixed(3)+'%'};
   }
 
-  // ── BEARISH CRT: swept ABOVE prev.high → rejected BACK BELOW ─────────────
-  if(curr.h>prev.h+sweepBuf && px<prev.h){
-    var sweepDepthB=(curr.h-prev.h)/prev.h*100;
-    var tpB=parseFloat(prev.l.toFixed(4));           // TP = prev candle LOW
-    var slB=parseFloat((curr.h*1.0005).toFixed(4));  // SL = just above sweep
-    var tpDistB=(px-tpB)/px*100, slDistB=(slB-px)/px*100;
-    var rrB=slDistB>0?tpDistB/slDistB:0;
-    if(tpDistB<FUT_RT*100+0.10)return null;
-    if(rrB<1.2)return null;
-    if(sweepDepthB<0.008)return null;
+  // BEARISH CRT: current candle swept ABOVE prev.high, price now back BELOW prev.high
+  if(curr.h > prev.h+sweepBuf && px < prev.h){
+    var sweepDB=(curr.h-prev.h)/prev.h*100;
+    if(sweepDB<minSweep)return null;
+    var tpB=parseFloat(prev.l.toFixed(4));
+    var slB=parseFloat((curr.h+(sweepBuf*0.3)).toFixed(4));
+    var tpDB=(px-tpB)/px*100, slDB=(slB-px)/px*100;
+    var rrB=slDB>0?tpDB/slDB:0;
+    if(tpDB<minTP||rrB<minRR)return null;
     S.crtStats.setups++;
-    return {
-      direction:'SHORT', type:'BEARISH_CRT',
-      sweepLevel:prev.h, sweepLow:null, sweepHigh:curr.h,
-      sweepDepth:sweepDepthB.toFixed(4),
-      entry:px, tp:tpB, sl:slB,
-      tpPct:parseFloat(tpDistB.toFixed(4)),
-      slPct:parseFloat(slDistB.toFixed(4)),
-      rr:parseFloat(rrB.toFixed(2)),
+    return {direction:'SHORT',type:'BEARISH_CRT',sweepLevel:prev.h,sweepLow:null,sweepHigh:curr.h,
+      sweepDepth:sweepDB.toFixed(4),entry:px,tp:tpB,sl:slB,
+      tpPct:parseFloat(tpDB.toFixed(4)),slPct:parseFloat(slDB.toFixed(4)),rr:parseFloat(rrB.toFixed(2)),
       prevRange:prevRangePct.toFixed(4),
-      reason:'Bearish CRT: swept $'+curr.h.toFixed(2)+' above prev.hi $'+prev.h.toFixed(2)+' R:R='+rrB.toFixed(2)
-    };
+      reason:'Bearish CRT: swept $'+curr.h.toFixed(2)+' above prev.hi $'+prev.h.toFixed(2)+' R:R='+rrB.toFixed(2)+'x range='+prevRangePct.toFixed(3)+'%'};
   }
   return null;
 }
@@ -512,6 +506,7 @@ function enterCRT(px,crt,isPaper){
     peakPx:px,peakNet:0,
     crtType:crt.type,crtRR:crt.rr,
     openAt:new Date().toISOString().slice(11,19),
+    openedAt:Date.now(),
     reason:crt.reason
   };
   log((isPaper?'CRT-PAPER ':'CRT-LIVE ')+(isLong?'LONG':'SHORT')+' @ $'+px.toFixed(2)+
@@ -1000,6 +995,25 @@ const server=http.createServer(function(req,res){
       }
       // ── RESET PAPER ────────────────────────────────────────────────────────
       if(url==='/resetpaper'){S.papProfit=0;S.papT=0;S.papW=0;S.papL=0;S.papBest=0;S.papFees=0;S.papTrades=[];S.papOrders=[];save();send(res,200,{ok:true});return;}
+      if(url==='/syncpositions'){
+        log('Manual position sync requested...','info');
+        syncMexcPositions(function(n){
+          send(res,200,{ok:true,synced:n,livePositions:S.futOrders.filter(function(o){return o.status==='open';}).length});
+        });
+        return;
+      }
+      if(url==='/closeallfutures'){
+        // Emergency: close ALL open futures positions on MEXC
+        var openPos=S.futOrders.filter(function(o){return o.status==='open';});
+        var px=S.futLastPx||S.lastPx;
+        openPos.forEach(function(o){
+          closeFutOrder(o,px,'EMERGENCY',false);
+          log('EMERGENCY CLOSE: '+o.direction+' entry=$'+o.entryPx.toFixed(2),'err');
+        });
+        S.futOrders=S.futOrders.filter(function(o){return o.status==='open';});
+        save();
+        send(res,200,{ok:true,closed:openPos.length}); return;
+      }
       send(res,404,{error:'Not found'});
     });
     return;
@@ -1007,18 +1021,92 @@ const server=http.createServer(function(req,res){
   send(res,404,{error:'Not found'});
 });
 
+// ── SYNC MEXC POSITIONS ──────────────────────────────────────────────────────
+// On startup: fetch real open positions from MEXC and add them to state.
+// This prevents "ghost positions" — MEXC has open trades but bot doesn't know.
+function syncMexcPositions(cb){
+  if(!S.apiKey||!S.apiSecret){if(cb)cb(0);return;}
+  var ts=Date.now().toString();
+  var sig=crypto.createHmac('sha256',S.apiSecret).update(S.apiKey+ts+'').digest('hex');
+  var req=https.request({
+    hostname:'contract.mexc.com', path:'/api/v1/private/position/open_positions',
+    method:'GET', headers:{'ApiKey':S.apiKey,'Request-Time':ts,'Signature':sig,'Content-Type':'application/json'},
+    timeout:8000
+  },function(res){
+    var d=''; res.on('data',function(c){d+=c;});
+    res.on('end',function(){
+      try{
+        var r=JSON.parse(d);
+        if(!r.success||!r.data||!r.data.length){if(cb)cb(0);return;}
+        var synced=0;
+        r.data.forEach(function(pos){
+          if(pos.symbol!==S.futPair)return;
+          // Check if we already track this position
+          var exists=S.futOrders.some(function(o){return o.mexcId===pos.positionId||o.status==='open';});
+          if(exists)return;
+          var isLong=pos.positionType===1;
+          var entryPx=parseFloat(pos.openAvgPrice||0);
+          var margin=parseFloat(pos.margin||S.futCapital/S.futMaxPos);
+          var lev=parseInt(pos.leverage||S.futLeverage);
+          var notional=margin*lev;
+          // Estimate TP/SL from current price
+          var curPx=S.futLastPx||entryPx;
+          var tp=isLong ? entryPx*(1+S.futTpPct/100) : entryPx*(1-S.futTpPct/100);
+          var sl=isLong ? entryPx*(1-S.futSlPct/100) : entryPx*(1+S.futSlPct/100);
+          var o={
+            id:Date.now()+synced, status:'open', isPaper:false, isFutures:true,
+            direction:isLong?'LONG':'SHORT',
+            entryPx:entryPx, margin:margin, leverage:lev, notional:notional,
+            contracts:parseInt(pos.holdVol||1),
+            tp:parseFloat(tp.toFixed(4)), sl:parseFloat(sl.toFixed(4)),
+            bePx:parseFloat(futBE(entryPx,margin,lev,isLong).toFixed(4)),
+            beStopMoved:false, peakPx:entryPx, peakNet:0,
+            crtType:'SYNCED', crtRR:0,
+            openAt:new Date().toISOString().slice(11,19),
+            mexcId:pos.positionId,
+            reason:'SYNCED from MEXC on startup'
+          };
+          S.futOrders.push(o); synced++;
+          log('SYNCED ghost position: '+o.direction+' entry=$'+entryPx.toFixed(2)+' margin=$'+margin.toFixed(2)+' contracts='+o.contracts,'err');
+        });
+        if(synced>0){
+          log('SYNCED '+synced+' MEXC position(s) that bot did not know about!','err');
+          log('These positions now have estimated TP/SL. Check MEXC app and close manually if needed.','info');
+          save();
+        } else {
+          log('MEXC position check: no ghost positions found.','info');
+        }
+        if(cb)cb(synced);
+      }catch(e){log('Position sync error: '+e.message,'err');if(cb)cb(0);}
+    });
+  });
+  req.on('error',function(e){log('Position sync network err: '+e.message,'err');if(cb)cb(0);});
+  req.on('timeout',function(){req.destroy();if(cb)cb(0);});
+  req.end();
+}
+
 // ── START ─────────────────────────────────────────────────────────────────────
 server.listen(PORT,'0.0.0.0',function(){
   console.log('Server listening on 0.0.0.0:'+PORT);
   load(); loadKeys(); startMulti();
   if(S.botOn||ENV_RUN){
-    S.botOn=true;S.liveOrders=[];S.papOrders=[];PX=[];ticks=0;
+    S.botOn=true; S.liveOrders=[]; S.papOrders=[]; PX=[]; ticks=0;
     log('Auto-resuming spot bot...','info'); startFeed();
   } else { log('Bot ready. Press Start.','info'); }
   if(S.futuresOn){
-    S.futOrders=[];S.futPapOrders=[];futPX=[];futTicks=0;
-    S.crtCandles=[];S.crtCurrentCandle=null;
-    log('Auto-resuming futures CRT bot...','info'); startFutFeed();
+    // DON'T wipe S.futOrders on restart — keep tracking existing positions!
+    // Instead sync with MEXC to find any ghost positions
+    S.futPapOrders=[]; futPX=[]; futTicks=0;
+    S.crtCandles=[]; S.crtCurrentCandle=null;
+    log('Auto-resuming futures CRT bot...','info');
+    startFutFeed();
+    // After 3s (price feed has started), sync MEXC positions
+    setTimeout(function(){
+      log('Checking MEXC for open positions not tracked by bot...','info');
+      syncMexcPositions(function(n){
+        if(n>0) log('ACTION REQUIRED: '+n+' untracked position(s) found. Dashboard now shows them.','err');
+      });
+    }, 3000);
   }
 });
 server.on('error',function(e){console.error(e);process.exit(1);});
