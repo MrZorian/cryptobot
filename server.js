@@ -13,6 +13,14 @@ const ENV_SECRET = (process.env.MEXC_SECRET||'').trim();
 console.log('=== CryptoBot Pro v10 ===');
 console.log('Port:',PORT);
 
+// ── GLOBAL ERROR HANDLERS — prevent Railway crashes ───────────────────────────
+process.on('uncaughtException', function(err){
+  console.error('[CRASH PREVENTED] uncaughtException:', err.message, err.stack);
+});
+process.on('unhandledRejection', function(reason, promise){
+  console.error('[CRASH PREVENTED] unhandledRejection:', reason);
+});
+
 // ── CONSTANTS ────────────────────────────────────────────────────────────────
 const FUT_TAKER   = 0.0002;      // 0.02% per side
 const SPOT_TAKER  = 0.0005;      // 0.05% per side
@@ -249,6 +257,7 @@ function crtDetect(px){
 // ── DEEPSEEK AI — CRT CONFIRMATION + TP/SL ───────────────────────────────────
 async function callDeepSeek(prompt){
   if(!S.aiKey)return null;
+  try{
   return new Promise(resolve=>{
     const body=JSON.stringify({
       model:'deepseek-chat',
@@ -281,6 +290,7 @@ async function callDeepSeek(prompt){
     req.on('timeout',()=>{req.destroy();resolve(null);});
     req.write(body); req.end();
   });
+  }catch(e){console.error('callDeepSeek err:',e.message);return null;}
 }
 
 async function aiConfirmCRT(px,crt){
@@ -466,7 +476,14 @@ function closeFut(o,px,why,isPaper){
 async function onFutTick(px){
   if(futTickBusy)return;
   futTickBusy=true;
-  try{await _processFutTick(px);}finally{futTickBusy=false;}
+  try{
+    await _processFutTick(px);
+  }catch(e){
+    console.error('[onFutTick error]',e.message);
+  }finally{
+    futTickBusy=false;
+    futEntering=false; // always release lock on error
+  }
 }
 async function _processFutTick(px){
   S.futLastPx=px; futPX.push(px); if(futPX.length>300)futPX.shift(); futTicks++;
@@ -662,6 +679,7 @@ function fetchSpot(){
   req.on('error',()=>{}); req.on('timeout',()=>req.destroy()); req.end();
 }
 function fetchFut(){
+  try{
   const req=https.request({hostname:'contract.mexc.com',path:'/api/v1/contract/ticker?symbol='+S.futPair,method:'GET',timeout:5000},res=>{
     let d=''; res.on('data',c=>d+=c);
     res.on('end',()=>{
@@ -670,6 +688,7 @@ function fetchFut(){
     });
   });
   req.on('error',()=>{if(S.lastPx>0)onFutTick(S.lastPx);}); req.on('timeout',()=>req.destroy()); req.end();
+  }catch(e){if(S.lastPx>0)onFutTick(S.lastPx);}
 }
 function fetchMulti(){
   const req=https.request({hostname:'api.mexc.com',path:'/api/v3/ticker/price',method:'GET',timeout:5000},res=>{
@@ -1043,7 +1062,7 @@ server.listen(PORT,'0.0.0.0',()=>{
   if(S.futuresOn){
     S.futPapOrders=[];futPX=[];futTicks=0;S.crtCandles=[];S.crtCurrentCandle=null;futTickBusy=false;futEntering=false;
     log('Auto-resuming futures CRT bot','info');startFutFeed();startAutoSync();
-    setTimeout(()=>syncMexc(n=>{if(n>0)log(n+' ghost position(s) found and synced!','err');},false),3000);
+    setTimeout(()=>{try{syncMexc(n=>{if(n>0)log(n+' ghost position(s) found and synced!','err');},false);}catch(e){log('sync err: '+e.message,'err');}},3000);
   }
 });
 server.on('error',e=>{console.error(e);process.exit(1);});
