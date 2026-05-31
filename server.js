@@ -53,6 +53,10 @@ let S = {
   futBaseCapital:20, futCompounded:0,
   // Sync
   lastSyncResult:null,
+  // Ghost trade prevention
+  lastCrtSig:'',          // signature of last entered CRT (direction+sweep level)
+  lastCrtSigTime:0,       // when that signal was entered
+  lastCrtCandle:null,     // which candle's H/L was swept — skip repeats
   // Misc
   startedAt:null, savedAt:null, mexcBalance:null,
 };
@@ -178,6 +182,8 @@ function crtUpdateCandle(px){
     S.crtCandles.unshift(Object.assign({},c));
     if(S.crtCandles.length>50)S.crtCandles.length=50;
     S.crtCurrentCandle={o:px,h:px,l:px,c:px,ticks:1};
+    // New candle formed — reset signal signature so fresh sweeps can be detected
+    S.lastCrtSig=''; S.lastCrtCandle=null;
   }
 }
 function crtDetect(px){
@@ -466,7 +472,34 @@ async function _processFutTick(px){
     }
     return;
   }
-  // LOCK immediately — block all other ticks while DeepSeek is being consulted
+
+  // ── GHOST TRADE PREVENTION ──────────────────────────────────────────────────
+  // Same sweep level stays valid for the ENTIRE candle (40 ticks = 60s).
+  // Without this check, the bot re-enters the SAME trade every 6s (cooldown),
+  // causing 5-8 ghost trades per CRT signal.
+  // Signature = direction + sweep level + prev candle H/L (unique per candle)
+  const prevC = S.crtCandles[0];
+  const crtSig = crt.direction + '_' +
+    (prevC ? prevC.h.toFixed(2)+'_'+prevC.l.toFixed(2) : 'none') + '_' +
+    (crt.direction==='BUY' ? crt.sweepLow : crt.sweepHigh||'?');
+  const sigAge = now - S.lastCrtSigTime;
+  const cancleDuration = S.crtCandleSize * 1500; // ms for one full candle
+
+  if(S.lastCrtSig === crtSig && sigAge < cancleDuration) {
+    // Already entered this exact sweep — wait for new candle before re-entering
+    if(futTicks % 20 === 0) log('CRT: same sweep already traded '+Math.round(sigAge/1000)+'s ago — waiting for new candle','info');
+    return;
+  }
+
+  // Check if position limit already reached (hard guard before any locking)
+  const papOpenCheck = S.futPapOrders.filter(function(o){return o.status==='open';}).length;
+  const liveOpenCheck = S.futOrders.filter(function(o){return o.status==='open';}).length;
+  if(liveOpenCheck >= S.futMaxPos) {
+    // Already at max live positions — do not enter
+    return;
+  }
+
+  // LOCK — block all other ticks while DeepSeek is being consulted
   futEntering=true;
   S.futLastEntry=now;
   log('CRT DETECTED: '+crt.type+' sweep='+crt.sweepDepth+'% R:R='+crt.rr+'x | asking DeepSeek AI...','buy');
@@ -487,6 +520,8 @@ async function _processFutTick(px){
     log('TRADE CONFIRMED: conf='+aiResult.confidence+'% TP=$'+aiResult.tp+' SL=$'+aiResult.sl+' | '+aiResult.reason,'profit');
     S.crtStats.confirmed++;
     S.crtLastSignal=Object.assign({},crt,{aiConfirmed:true,aiConf:aiResult.confidence,aiTp:aiResult.tp,aiSl:aiResult.sl,aiReason:aiResult.reason});
+    // Record signature IMMEDIATELY so any concurrent ticks are blocked for this candle
+    S.lastCrtSig=crtSig; S.lastCrtSigTime=now; S.lastCrtCandle=prevC;
     const targetNotional=(S.futCapital/S.futMaxPos)*S.futLeverage;
     const lots=calcLots(targetNotional,px);
     const streak=S.futTrades.slice(0,3).filter(function(t){return t.net<0;}).length;
@@ -524,8 +559,22 @@ function enterFut(px,crt,ai,lots,isPaper){
     ' | notional=$'+(o.notional).toFixed(2)+
     ' | TP=$'+ai.tp.toFixed(2)+' SL=$'+ai.sl.toFixed(2)+
     ' | exp net=+'+(expNet>0?'$'+expNet.toFixed(4):'calculating'),'buy');
-  if(isPaper)S.futPapOrders.push(o);
-  else{S.futOrders.push(o);futPlaceOrder(isLng?'open_long':'open_short',lots,px);}
+  if(isPaper){
+    // Paper: check we don't exceed maxPos
+    const papCount=S.futPapOrders.filter(function(x){return x.status==='open';}).length;
+    if(papCount>=S.futMaxPos){log('Paper maxPos reached — skipping paper entry','info');return;}
+    S.futPapOrders.push(o);
+  } else {
+    // Live: hard check before placing ANY MEXC order
+    const liveCount=S.futOrders.filter(function(x){return x.status==='open';}).length;
+    if(liveCount>=S.futMaxPos){
+      log('LIVE maxPos reached — NOT placing MEXC order (ghost trade prevented)','err');
+      return;
+    }
+    S.futOrders.push(o);
+    log('Placing MEXC order: lots='+lots+' direction='+(isLng?'LONG':'SHORT'),'info');
+    futPlaceOrder(isLng?'open_long':'open_short',lots,px);
+  }
 }
 
 // ── SPOT TICK ────────────────────────────────────────────────────────────────
@@ -791,7 +840,7 @@ const server=http.createServer((req,res)=>{
       futOrders:futLO.map(mapFut),futPapOrders:futPO.map(mapFut),
       futTrades:S.futTrades.slice(0,60),futPapTrades:S.futPapTrades.slice(0,60),
       futRealBalance:S.futRealBalance||0,futTicks,
-      crtStats:S.crtStats,crtCandleSize:S.crtCandleSize,
+      crtStats:S.crtStats,crtCandleSize:S.crtCandleSize,lastCrtSig:S.lastCrtSig,lastCrtSigTime:S.lastCrtSigTime,
       crtLastSignal:S.crtLastSignal,crtCandles:S.crtCandles.slice(0,5),crtCurrentCandle:S.crtCurrentCandle,
       aiEnabled:!!(S.aiKey),aiMinConf:S.aiMinConf,aiInterval:S.aiInterval,
       aiFutDecision:S.aiFutDecision,aiCallCount:S.aiCallCount,aiTokensUsed:S.aiTokensUsed,aiCost:S.aiCost,
