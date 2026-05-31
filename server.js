@@ -198,58 +198,71 @@ function crtUpdateCandle(px){
 }
 
 function crtDetect(px){
-  if(S.crtCandles.length<2)return null;
-  const prev=S.crtCandles[0], curr=S.crtCurrentCandle;
-  if(!prev||!curr)return null;
+  // Need at least 1 completed candle to use as reference
+  if(!S.crtCandles.length||!S.crtCurrentCandle)return null;
+  const prev = S.crtCandles[0];   // most recent COMPLETED candle
+  const curr = S.crtCurrentCandle; // candle currently forming
 
   const prevRange    = prev.h - prev.l;
   const prevRangePct = prevRange / prev.l * 100;
 
-  // Very loose range filter — don't reject small candles
-  if(prevRangePct < 0.012) return null;
+  // Need minimum candle range to be worth trading
+  if(prevRangePct < 0.010) return null;
 
-  // Adaptive sweep buffer: 8% of range OR 0.005% of price
-  const sweepBuf = Math.max(prevRange * 0.08, prev.l * 0.00005);
-
-  // Only R:R filter — removed minTP (was blocking 75%+ of valid setups!)
-  const minRR = 0.75;
+  // Sweep buffer: 6% of range OR 0.004% of price (whichever is smaller avoidance)
+  const sweepBuf = Math.max(prevRange * 0.06, prev.l * 0.00004);
+  const minRR    = 0.70; // relaxed — high CRT win rate compensates
 
   // ── BULLISH CRT ──────────────────────────────────────────────────────────
+  // Current candle swept BELOW prev.low (stop hunt below support)
+  // Price has now rejected back ABOVE prev.low (reversal confirmed)
   if(curr.l < prev.l - sweepBuf && px > prev.l){
     const sweepD = (prev.l - curr.l) / prev.l * 100;
     if(sweepD < 0.001) return null;
     const tp  = parseFloat(prev.h.toFixed(2));
-    const sl  = parseFloat((curr.l - sweepBuf * 0.2).toFixed(2));
+    const sl  = parseFloat((curr.l - sweepBuf * 0.15).toFixed(2));
     const tpD = (tp - px) / px * 100;
     const slD = (px - sl) / px * 100;
     const rr  = slD > 0 ? tpD / slD : 0;
     if(rr < minRR || tp <= px) return null;
     S.crtStats.setups++;
-    return {direction:'BUY',type:'BULLISH_CRT',
-      sweepDepth:sweepD.toFixed(4),sweepLow:curr.l,sweepHigh:null,
-      entry:px,tp:tp,sl:sl,
-      tpPct:parseFloat(tpD.toFixed(4)),slPct:parseFloat(slD.toFixed(4)),
-      rr:parseFloat(rr.toFixed(2)),prevRange:prevRangePct.toFixed(4),
-      reason:'Bullish CRT: swept $'+curr.l.toFixed(2)+' below $'+prev.l.toFixed(2)+' R:R='+rr.toFixed(2)+'x range='+prevRangePct.toFixed(3)+'%'};
+    return {
+      direction:'BUY', type:'BULLISH_CRT',
+      sweepDepth:sweepD.toFixed(4), sweepLow:curr.l, sweepHigh:null,
+      entry:px, tp:tp, sl:sl,
+      tpPct:parseFloat(tpD.toFixed(4)), slPct:parseFloat(slD.toFixed(4)),
+      rr:parseFloat(rr.toFixed(2)), prevRange:prevRangePct.toFixed(4),
+      prevHigh:prev.h, prevLow:prev.l,
+      reason:'BULLISH CRT: swept $'+curr.l.toFixed(2)+' below prev.L $'+prev.l.toFixed(2)+
+             ' | entry=$'+px.toFixed(2)+' TP=$'+tp.toFixed(2)+' SL=$'+sl.toFixed(2)+
+             ' R:R='+rr.toFixed(2)+'x'
+    };
   }
 
   // ── BEARISH CRT ──────────────────────────────────────────────────────────
+  // Current candle swept ABOVE prev.high (stop hunt above resistance)
+  // Price has now rejected back BELOW prev.high (reversal confirmed)
   if(curr.h > prev.h + sweepBuf && px < prev.h){
     const sweepDB = (curr.h - prev.h) / prev.h * 100;
     if(sweepDB < 0.001) return null;
     const tpB  = parseFloat(prev.l.toFixed(2));
-    const slB  = parseFloat((curr.h + sweepBuf * 0.2).toFixed(2));
+    const slB  = parseFloat((curr.h + sweepBuf * 0.15).toFixed(2));
     const tpDB = (px - tpB) / px * 100;
     const slDB = (slB - px) / px * 100;
     const rrB  = slDB > 0 ? tpDB / slDB : 0;
     if(rrB < minRR || tpB >= px) return null;
     S.crtStats.setups++;
-    return {direction:'SHORT',type:'BEARISH_CRT',
-      sweepDepth:sweepDB.toFixed(4),sweepLow:null,sweepHigh:curr.h,
-      entry:px,tp:tpB,sl:slB,
-      tpPct:parseFloat(tpDB.toFixed(4)),slPct:parseFloat(slDB.toFixed(4)),
-      rr:parseFloat(rrB.toFixed(2)),prevRange:prevRangePct.toFixed(4),
-      reason:'Bearish CRT: swept $'+curr.h.toFixed(2)+' above $'+prev.h.toFixed(2)+' R:R='+rrB.toFixed(2)+'x range='+prevRangePct.toFixed(3)+'%'};
+    return {
+      direction:'SHORT', type:'BEARISH_CRT',
+      sweepDepth:sweepDB.toFixed(4), sweepLow:null, sweepHigh:curr.h,
+      entry:px, tp:tpB, sl:slB,
+      tpPct:parseFloat(tpDB.toFixed(4)), slPct:parseFloat(slDB.toFixed(4)),
+      rr:parseFloat(rrB.toFixed(2)), prevRange:prevRangePct.toFixed(4),
+      prevHigh:prev.h, prevLow:prev.l,
+      reason:'BEARISH CRT: swept $'+curr.h.toFixed(2)+' above prev.H $'+prev.h.toFixed(2)+
+             ' | entry=$'+px.toFixed(2)+' TP=$'+tpB.toFixed(2)+' SL=$'+slB.toFixed(2)+
+             ' R:R='+rrB.toFixed(2)+'x'
+    };
   }
   return null;
 }
@@ -472,108 +485,130 @@ function closeFut(o,px,why,isPaper){
     ' net='+(r.net>=0?'+':'')+'$'+r.net.toFixed(4), r.net>=0?'profit':'err');
 }
 
-// ── FUTURES TICK — MUTEX LOCKED ───────────────────────────────────────────────
+// ── FUTURES TICK ────────────────────────────────────────────────────────────────
+// ARCHITECTURE: Exit checks + candle updates run on EVERY tick (never blocked).
+// Entry detection runs only when AI is NOT busy (futEntering=false).
 async function onFutTick(px){
-  if(futTickBusy)return;
-  futTickBusy=true;
   try{
-    await _processFutTick(px);
-  }catch(e){
-    console.error('[onFutTick error]',e.message);
-  }finally{
-    futTickBusy=false;
-    futEntering=false; // always release lock on error
-  }
-}
-async function _processFutTick(px){
-  S.futLastPx=px; futPX.push(px); if(futPX.length>300)futPX.shift(); futTicks++;
-  if(!S.futuresOn)return;
-  crtUpdateCandle(px);
-  futExitCheck(px,true);
-  futExitCheck(px,false);
-  if(futTicks<5)return;
-  const now=Date.now();
-  if(now-S.futLastEntry<(S.futCooldown||6000))return;
-  if(futEntering)return; // extra guard
-  const papOpen=S.futPapOrders.filter(o=>o.status==='open').length;
-  const liveOpen=S.futOrders.filter(o=>o.status==='open').length;
-  if(papOpen>=S.futMaxPos&&liveOpen>=S.futMaxPos)return;
-  const crt=crtDetect(px);
-  if(!crt){
-    // Periodic log so user can see CRT engine is scanning
-    if(futTicks%40===0){
-      const p=S.crtCandles[0],c=S.crtCurrentCandle;
-      if(p&&c)log('[CRT T'+futTicks+'] $'+px.toFixed(2)+' prevH=$'+p.h.toFixed(2)+' prevL=$'+p.l.toFixed(2)+' currH=$'+c.h.toFixed(2)+' currL=$'+c.l.toFixed(2)+' tick='+c.ticks+'/'+S.crtCandleSize+' setups='+S.crtStats.setups,'info');
-      else log('[CRT T'+futTicks+'] $'+px.toFixed(2)+' candles='+S.crtCandles.length+'/2 needed','info');
+    // ── STEP 1: ALWAYS update price buffer, candle, check exits ─────────────
+    S.futLastPx=px;
+    futPX.push(px); if(futPX.length>300)futPX.shift();
+    futTicks++;
+    if(!S.futuresOn)return;
+    crtUpdateCandle(px);      // build OHLC candle
+    futExitCheck(px,true);    // check paper position exits
+    futExitCheck(px,false);   // check live position exits
+
+    // ── STEP 2: ENTRY DETECTION (skip if AI busy or too soon) ───────────────
+    if(futTicks<5)return;
+    if(futEntering)return;    // AI is running — don't overlap
+    const now=Date.now();
+    if(now-S.futLastEntry<(S.futCooldown||6000))return;
+
+    // Skip if all position slots full
+    const papOpen=S.futPapOrders.filter(function(o){return o.status==='open';}).length;
+    const liveOpen=S.futOrders.filter(function(o){return o.status==='open';}).length;
+    if(papOpen>=S.futMaxPos && liveOpen>=S.futMaxPos)return;
+
+    // ── STEP 3: CRT DETECTION ────────────────────────────────────────────────
+    const crt=crtDetect(px);
+    if(!crt){
+      if(futTicks%40===0){
+        const p=S.crtCandles[0],c=S.crtCurrentCandle;
+        if(p&&c) log('[CRT T'+futTicks+'] $'+px.toFixed(2)+
+          ' prevH=$'+p.h.toFixed(2)+' prevL=$'+p.l.toFixed(2)+
+          ' currH=$'+c.h.toFixed(2)+' currL=$'+c.l.toFixed(2)+
+          ' tick='+c.ticks+'/'+S.crtCandleSize+
+          ' candles='+S.crtCandles.length+' setups='+S.crtStats.setups,'info');
+        else log('[CRT T'+futTicks+'] $'+px.toFixed(2)+' warming up: '+S.crtCandles.length+' candles (need 1+)','info');
+      }
+      return;
     }
-    return;
-  }
 
-  // GHOST TRADE PREVENTION: mark this sweep seen BEFORE async AI call
-  // Same sweep fires every 1.5s for 60s — without dedup = 40 duplicate trades
-  const crtSig=crt.direction+'_'+(S.crtCandles[0]?S.crtCandles[0].h.toFixed(2)+'_'+S.crtCandles[0].l.toFixed(2):'x')+'_'+(crt.direction==='BUY'?crt.sweepLow:crt.sweepHigh||'x');
-  if(S.lastCrtSig===crtSig)return; // already handling this sweep
-  S.lastCrtSig=crtSig; S.lastCrtSigTime=now;
+    // ── STEP 4: GHOST TRADE PREVENTION ───────────────────────────────────────
+    // Use FIXED prev.h/prev.l as signature (stable — don't use curr.l/curr.h
+    // which change every tick and would re-fire the same setup 40 times)
+    const crtSig=crt.direction+'_'+crt.prevHigh+'_'+crt.prevLow;
+    if(S.lastCrtSig===crtSig)return;  // same setup already handled this candle
+    S.lastCrtSig=crtSig;
+    S.lastCrtSigTime=now;
 
-  // Hard position cap
-  if(S.futOrders.filter(function(o){return o.status==='open';}).length>=S.futMaxPos)return;
+    // Extra live position cap guard
+    if(liveOpen>=S.futMaxPos && S.futMode==='live')return;
 
-  // LOCK — block all other ticks while DeepSeek is being consulted
-  futEntering=true;
-  S.futLastEntry=now;
-  log('CRT DETECTED: '+crt.type+' sweep='+crt.sweepDepth+'% R:R='+crt.rr+'x | asking DeepSeek AI...','buy');
-  try{
-    // STRICT MODE: DeepSeek confirms every trade and sets TP/SL
-    // No AI key = no trade. AI timeout = no trade. AI rejects = no trade.
+    // ── STEP 5: DEEPSEEK AI CONFIRMATION (mandatory) ─────────────────────────
+    futEntering=true;       // block new entry attempts while AI thinks
+    S.futLastEntry=now;
+    log('CRT DETECTED: '+crt.type+
+      ' @ $'+px.toFixed(2)+
+      ' sweep='+crt.sweepDepth+'%'+
+      ' R:R='+crt.rr+'x'+
+      ' TP=$'+crt.tp+' SL=$'+crt.sl+
+      ' | asking DeepSeek...','buy');
+
     const aiResult=await aiConfirmCRT(px,crt);
+
     if(!aiResult.confirmed){
-      log('TRADE SKIPPED: '+aiResult.reason,'info');
-      S.crtLastSignal=Object.assign({},crt,{aiRejected:true,aiReason:aiResult.reason,aiConf:aiResult.confidence});
+      log('TRADE SKIPPED by AI: '+aiResult.reason,'info');
+      S.crtLastSignal=Object.assign({},crt,{aiRejected:true,aiReason:aiResult.reason});
       return;
     }
     if(aiResult.confidence<(S.aiMinConf||65)){
-      log('TRADE SKIPPED: conf '+aiResult.confidence+'% < min '+(S.aiMinConf||65)+'%','info');
-      S.crtLastSignal=Object.assign({},crt,{aiRejected:true,aiReason:'Low confidence: '+aiResult.confidence+'%'});
+      log('TRADE SKIPPED: AI conf='+aiResult.confidence+'% < min='+(S.aiMinConf||65)+'%','info');
       return;
     }
-    log('TRADE CONFIRMED: conf='+aiResult.confidence+'% TP=$'+aiResult.tp+' SL=$'+aiResult.sl+' | '+aiResult.reason,'profit');
+
+    log('TRADE CONFIRMED by DeepSeek: conf='+aiResult.confidence+
+      '% TP=$'+aiResult.tp+' SL=$'+aiResult.sl+
+      ' | '+aiResult.reason,'profit');
     S.crtStats.confirmed++;
-    S.crtLastSignal=Object.assign({},crt,{aiConfirmed:true,aiConf:aiResult.confidence,aiTp:aiResult.tp,aiSl:aiResult.sl,aiReason:aiResult.reason});
+    S.crtLastSignal=Object.assign({},crt,{
+      aiConfirmed:true, aiConf:aiResult.confidence,
+      aiTp:aiResult.tp, aiSl:aiResult.sl, aiReason:aiResult.reason
+    });
 
-    // RE-READ positions NOW — AI took 8-10s, stale papOpen/liveOpen would block entry
-    var papOpenNow  = S.futPapOrders.filter(function(o){return o.status==='open';}).length;
-    var liveOpenNow = S.futOrders.filter(function(o){return o.status==='open';}).length;
+    // ── STEP 6: ENTER TRADE ──────────────────────────────────────────────────
+    // Re-read position counts (AI took 8-10s — old values are stale)
+    const papNow  = S.futPapOrders.filter(function(o){return o.status==='open';}).length;
+    const liveNow = S.futOrders.filter(function(o){return o.status==='open';}).length;
 
-    var targetNotional=(S.futCapital/S.futMaxPos)*S.futLeverage;
-    var lots=calcLots(targetNotional,px);
-    var streak=S.futTrades.slice(0,3).filter(function(t){return t.net<0;}).length;
-    var finalLots=streak>=3?Math.max(1,Math.floor(lots*0.5)):streak>=2?Math.max(1,Math.floor(lots*0.75)):lots;
-    if(streak>=2)log('Recovery x'+(streak>=3?'0.5':'0.75')+' size ('+streak+' losses)','info');
+    const notional=(S.futCapital/S.futMaxPos)*S.futLeverage;
+    const lots=calcLots(notional,px);
+    const streak=S.futTrades.slice(0,3).filter(function(t){return t.net<0;}).length;
+    const finalLots=streak>=3?Math.max(1,Math.floor(lots*0.5)):streak>=2?Math.max(1,Math.floor(lots*0.75)):lots;
 
-    log('ENTRY CHECK: mode='+S.futMode+' paper='+papOpenNow+'/'+S.futMaxPos+' live='+liveOpenNow+'/'+S.futMaxPos+' lots='+finalLots+'','info');
+    log('ENTRY: mode='+S.futMode+
+      ' paper='+papNow+'/'+S.futMaxPos+
+      ' live='+liveNow+'/'+S.futMaxPos+
+      ' lots='+finalLots+
+      ' notional=$'+(finalLots*MEXC_LOT_BTC*px).toFixed(2),'info');
 
-    // Paper entry — always runs
-    if(papOpenNow<S.futMaxPos){
+    // Paper trade (always enters if slot available)
+    if(papNow<S.futMaxPos){
       enterFut(px,crt,aiResult,finalLots,true);
-    } else {
-      log('Paper SKIPPED: already '+papOpenNow+'/'+S.futMaxPos+' open','info');
+    }else{
+      log('Paper SKIPPED: '+papNow+'/'+S.futMaxPos+' positions open','info');
     }
 
-    // Live entry
+    // Live trade
     if(S.futMode==='live'){
       if(!S.apiKey||!S.apiSecret){
-        log('Live SKIPPED: no API keys — save them in Config tab','err');
-      } else if(liveOpenNow>=S.futMaxPos){
-        log('Live SKIPPED: '+liveOpenNow+'/'+S.futMaxPos+' positions already open','info');
-      } else {
+        log('Live SKIPPED: no API keys — save in Config tab','err');
+      }else if(liveNow>=S.futMaxPos){
+        log('Live SKIPPED: '+liveNow+'/'+S.futMaxPos+' already open','info');
+      }else{
         S.crtStats.entered++;
         enterFut(px,crt,aiResult,finalLots,false);
-        log('LIVE ORDER sent to MEXC','profit');
+        log('LIVE ORDER placed on MEXC','profit');
       }
-    } else {
-      log('Live SKIPPED: mode='+S.futMode+' (click Futures Live Mode to trade real money)','info');
+    }else{
+      log('Live SKIPPED: mode='+S.futMode+' — click Futures Live Mode to trade real money','info');
     }
-  }finally{futEntering=false;}
+  }catch(e){
+    console.error('[onFutTick error]',e.message);
+  }finally{
+    futEntering=false;  // always release lock
+  }
 }
 
 function enterFut(px,crt,ai,lots,isPaper){
