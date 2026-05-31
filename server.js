@@ -72,6 +72,8 @@ let S = {
 // ── LOCKS — prevent concurrent ghost trades ───────────────────────────────────
 let futTickBusy = false;
 let futEntering = false;
+let liveOrderPending = false;   // true while a live MEXC order is being sent
+let lastEntryCandleCount = -1;  // which candle index we last entered on (1 trade/candle)
 
 // ── PRICE BUFFERS ────────────────────────────────────────────────────────────
 let PX=[], futPX=[], ticks=0, futTicks=0;
@@ -419,7 +421,7 @@ async function aiSetTpSlForPosition(o){
   save();
 }
 
-// ── EXIT CHECKS ───────────────────────────────────────────────────────────────
+// ── EXIT CHECKS — with PROFIT LOCKING (guarantees net-positive exits) ─────────
 function futExitCheck(px,isPaper){
   const orders=isPaper?S.futPapOrders:S.futOrders;
   let changed=false;
@@ -427,21 +429,46 @@ function futExitCheck(px,isPaper){
     if(o.status!=='open')return;
     const isLng=o.direction!=='SHORT';
     const r=futCalcPnl(o.entryPx,px,o.lots||1,isLng);
-    // Track peak raw pnl (matches MEXC display)
-    if(r.pnl>(o.peakPnl||0))o.peakPnl=r.pnl;
-    // Profit protection: gave back 60% of peak while still positive
-    if((o.peakPnl||0)>r.fee*2&&r.pnl>0&&(o.peakPnl-r.pnl)/o.peakPnl>=0.60){
-      closeFut(o,px,'PROTECT',isPaper); changed=true; return;
+    const netNow=r.net;     // profit AFTER all fees — this is real take-home
+    const feeRT=r.fee;      // round-trip fee for this position
+
+    // Track peak NET profit (after fees) — this is what we protect
+    if(netNow>(o.peakNet||0))o.peakNet=netNow;
+
+    // ── PROFIT LOCK ───────────────────────────────────────────────────────
+    // Once net profit has been meaningfully positive, never let it turn negative.
+    // As price rises, raise a trailing floor. If price retraces to the floor,
+    // close IMMEDIATELY while still net-positive (guaranteed profit after fees).
+    if((o.peakNet||0) > feeRT*0.5){
+      // We have real profit. Calculate the trailing floor:
+      //  - give back at most 45% of the peak net profit
+      //  - but the floor is NEVER below a tiny positive amount (stays profitable)
+      const giveback = (o.peakNet) * 0.45;
+      const floor    = Math.max(o.peakNet - giveback, feeRT*0.15); // always > 0
+      if(netNow>0 && netNow<=floor){
+        log('PROFIT-LOCK: peak net was +$'+o.peakNet.toFixed(4)+
+            ', closing at +$'+netNow.toFixed(4)+' (locked profit after fees)','profit');
+        closeFut(o,px,'PROFIT-LOCK',isPaper); changed=true; return;
+      }
     }
-    // BE-stop: at 40% toward TP, move SL to break-even
-    if(!o.beStopMoved&&isLng){
-      const pct=(o.tp-o.entryPx)>0?(px-o.entryPx)/(o.tp-o.entryPx):0;
-      if(pct>=0.40){const be=futBE(o.entryPx,o.lots||1,isLng);if(be>o.sl){o.sl=parseFloat(be.toFixed(4));o.beStopMoved=true;log('BE-stop moved to $'+o.sl.toFixed(2),'info');}}
+
+    // ── TRAILING SL: move stop loss up to break-even once in decent profit ──
+    // Break-even price = where net profit = 0 after both fees
+    if(!o.beStopMoved){
+      const beNet = isLng ? o.entryPx*(1+FUT_TAKER*2.2) : o.entryPx*(1-FUT_TAKER*2.2);
+      // Activate when price is 50% of the way to TP
+      const prog = isLng ? (o.tp-o.entryPx>0 ? (px-o.entryPx)/(o.tp-o.entryPx) : 0)
+                         : (o.entryPx-o.tp>0 ? (o.entryPx-px)/(o.entryPx-o.tp) : 0);
+      if(prog>=0.40){
+        if(isLng && beNet>o.sl){ o.sl=parseFloat(beNet.toFixed(2)); o.beStopMoved=true; log('SL→break-even $'+o.sl.toFixed(2)+' (profit locked)','info'); }
+        if(!isLng && beNet<o.sl){ o.sl=parseFloat(beNet.toFixed(2)); o.beStopMoved=true; log('SL→break-even $'+o.sl.toFixed(2)+' (profit locked)','info'); }
+      }
     }
-    // TP / SL
+
+    // ── HARD TP / SL ────────────────────────────────────────────────────────
     let why=null;
-    if(isLng){if(px>=o.tp)why='TP';else if(px<=o.sl)why=o.beStopMoved?'BE-STOP':'SL';}
-    else{if(px<=o.tp)why='TP';else if(px>=o.sl)why=o.beStopMoved?'BE-STOP':'SL';}
+    if(isLng){ if(px>=o.tp)why='TP'; else if(px<=o.sl)why=o.beStopMoved?'BE-STOP':'SL'; }
+    else     { if(px<=o.tp)why='TP'; else if(px>=o.sl)why=o.beStopMoved?'BE-STOP':'SL'; }
     if(!why)return;
     closeFut(o,px,why,isPaper); changed=true;
   });
@@ -528,8 +555,20 @@ async function onFutTick(px){
     // ── STEP 4: GHOST TRADE PREVENTION ───────────────────────────────────────
     // Use FIXED prev.h/prev.l as signature (stable — don't use curr.l/curr.h
     // which change every tick and would re-fire the same setup 40 times)
+    // ── STEP 4: GHOST TRADE PREVENTION (4 hard locks) ───────────────────────
+    // Lock A: one trade per candle. Once we enter on a candle, no more entries
+    //         until a NEW candle forms — kills re-entry after AI-call candle flip.
+    if(lastEntryCandleCount === S.crtCandles.length){
+      return; // already traded on this candle
+    }
+    // Lock B: signature dedup — same sweep (fixed prev H/L) can't fire twice
     const crtSig=crt.direction+'_'+crt.prevHigh+'_'+crt.prevLow;
-    if(S.lastCrtSig===crtSig)return;  // same setup already handled this candle
+    if(S.lastCrtSig===crtSig)return;
+    // Lock C: a live order is currently being sent to MEXC — don't overlap
+    if(liveOrderPending){
+      log('Entry blocked: previous live order still pending','info');
+      return;
+    }
     S.lastCrtSig=crtSig;
     S.lastCrtSigTime=now;
 
@@ -596,14 +635,22 @@ async function onFutTick(px){
         log('Live SKIPPED: no API keys — save in Config tab','err');
       }else if(liveNow>=S.futMaxPos){
         log('Live SKIPPED: '+liveNow+'/'+S.futMaxPos+' already open','info');
+      }else if(liveOrderPending){
+        log('Live SKIPPED: an order is already being placed','info');
       }else{
+        // Lock D: block any other live order until this one is sent + cooldown
+        liveOrderPending=true;
         S.crtStats.entered++;
         enterFut(px,crt,aiResult,finalLots,false);
         log('LIVE ORDER placed on MEXC','profit');
+        // Release after 8s (enough for MEXC to register the position)
+        setTimeout(function(){ liveOrderPending=false; }, 8000);
       }
     }else{
       log('Live SKIPPED: mode='+S.futMode+' — click Futures Live Mode to trade real money','info');
     }
+    // Record candle count so no second trade fires on this same candle
+    lastEntryCandleCount = S.crtCandles.length;
   }catch(e){
     console.error('[onFutTick error]',e.message);
   }finally{
@@ -879,7 +926,7 @@ function send(res,code,data){cors(res);res.writeHead(code,{'Content-Type':'appli
 const server=http.createServer((req,res)=>{
   if(req.method==='OPTIONS'){cors(res);res.writeHead(204);res.end();return;}
   const url=req.url.split('?')[0];
-  if(url==='/'||url==='/ping'||url==='/health'){send(res,200,{ok:true,uptime:process.uptime().toFixed(0)+'s',v:'v9'});return;}
+  if(url==='/'||url==='/ping'||url==='/health'){send(res,200,{ok:true,uptime:process.uptime().toFixed(0)+'s',v:'v10'});return;}
   if(url==='/prices'){send(res,200,{prices:S.prices,ticks,futTicks});return;}
   if(req.headers['x-bot-pin']!==BOT_PIN){send(res,401,{error:'Invalid PIN'});return;}
 
@@ -950,7 +997,7 @@ const server=http.createServer((req,res)=>{
         S.futuresOn=true;S.futOrders=[];S.futPapOrders=[];S.futLastEntry=0;
         S.crtCandles=[];S.crtCurrentCandle=null;S.crtLastSignal=null;
         S.crtStats={setups:0,confirmed:0,entered:0};futPX=[];futTicks=0;
-        futTickBusy=false;futEntering=false;
+        futTickBusy=false;futEntering=false;liveOrderPending=false;lastEntryCandleCount=-1;
         if(d.mode)S.futMode=d.mode;if(d.pair)S.futPair=d.pair;
         if(d.capital)S.futCapital=parseFloat(d.capital)||20;
         if(d.leverage)S.futLeverage=parseInt(d.leverage)||3;
