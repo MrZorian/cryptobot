@@ -9,6 +9,7 @@ const PORT       = parseInt(process.env.PORT||'3000');
 const BOT_PIN    = process.env.BOT_PIN||'123456';
 const ENV_KEY    = (process.env.MEXC_KEY   ||'').trim();
 const ENV_SECRET = (process.env.MEXC_SECRET||'').trim();
+const ENV_AI_KEY = (process.env.DEEPSEEK_KEY||'').trim();
 
 console.log('=== CryptoBot Pro v10 ===');
 console.log('Port:',PORT);
@@ -45,6 +46,7 @@ let S = {
   futuresOn:false, futMode:'paper', futPair:'BTC_USDT',
   futCapital:20, futMaxPos:1, futLeverage:3,
   futTpPct:0.35, futSlPct:0.18, futCooldown:6000,
+  quickProfitTarget:0.10,  // close immediately when net profit (after fees) reaches this $
   futProfit:0, futT:0, futW:0, futL:0, futBest:0, futFees:0,
   futPapProfit:0, futPapT:0, futPapW:0, futPapL:0,
   futOrders:[], futPapOrders:[], futTrades:[], futPapTrades:[],
@@ -434,6 +436,14 @@ function futExitCheck(px,isPaper){
     const r=futCalcPnl(o.entryPx,px,o.lots||1,isLng);
     const netNow=r.net;     // profit AFTER all fees — this is real take-home
     const feeRT=r.fee;      // round-trip fee for this position
+
+    // ── QUICK PROFIT TARGET — close instantly at $0.10 net profit ─────────
+    // User-configurable target. Captures small wins fast before price reverses.
+    const target=S.quickProfitTarget||0.10;
+    if(netNow>=target){
+      log('QUICK-TARGET HIT: net=+$'+netNow.toFixed(4)+' (target $'+target.toFixed(2)+') — closing','profit');
+      closeFut(o,px,'QUICK-TARGET',isPaper); changed=true; return;
+    }
 
     // Track peak NET profit (after fees) — this is what we protect
     if(netNow>(o.peakNet||0))o.peakNet=netNow;
@@ -980,6 +990,7 @@ const server=http.createServer((req,res)=>{
       aiEnabled:!!(S.aiKey),aiMinConf:S.aiMinConf,aiInterval:S.aiInterval,
       aiFutDecision:S.aiFutDecision,aiCallCount:S.aiCallCount,aiTokensUsed:S.aiTokensUsed,aiCost:S.aiCost,
       compoundEnabled:S.compoundEnabled,compoundPct:S.compoundPct,
+      quickProfitTarget:S.quickProfitTarget||0.10,
       futBaseCapital:S.futBaseCapital||S.futCapital,futCompounded:S.futCompounded||0,
       autoSync:!!(autoSyncTimer),lastSyncResult:S.lastSyncResult,
       hasApiKeys:!!(S.apiKey&&S.apiSecret),startedAt:S.startedAt,savedAt:S.savedAt,
@@ -1099,6 +1110,12 @@ const server=http.createServer((req,res)=>{
         else{S.liveProfit+=r.net;S.feesT+=r.fee;if(r.net>=0){S.liveW++;if(r.net>S.bestT)S.bestT=r.net;}else S.liveL++;S.liveTrades.unshift(tr);S.liveOrders=S.liveOrders.filter(o=>o.status==='open');placeSpotOrder('SELL',o.qty,S.pair);}
         save();send(res,200,{ok:true,net:r.net});return;
       }
+      if(url==='/setquicktarget'){
+        if(d.target===undefined){send(res,400,{error:'target $ required'});return;}
+        S.quickProfitTarget=Math.max(0.01,parseFloat(d.target)||0.10);
+        log('Quick profit target set to $'+S.quickProfitTarget.toFixed(2),'info');
+        save();send(res,200,{ok:true,target:S.quickProfitTarget});return;
+      }
       if(url==='/setcompound'){
         S.compoundEnabled=!!d.enabled;if(d.pct)S.compoundPct=Math.min(100,Math.max(1,parseInt(d.pct)||100));
         if(S.compoundEnabled)S.futBaseCapital=S.futCapital;
@@ -1171,6 +1188,12 @@ const server=http.createServer((req,res)=>{
 server.listen(PORT,'0.0.0.0',()=>{
   console.log('Server listening on 0.0.0.0:'+PORT);
   load(); loadKeys(); startMultiFeed();
+  // Auto-load DeepSeek key from Railway env if not saved
+  if(ENV_AI_KEY && !S.aiKey){
+    S.aiKey = ENV_AI_KEY;
+    log('DeepSeek API key loaded from Railway env (DEEPSEEK_KEY)','info');
+    save();
+  }
   if(S.botOn){S.liveOrders=[];S.papOrders=[];PX=[];ticks=0;log('Auto-resuming spot bot','info');startSpotFeed();}
   else log('Bot ready. Press Start.','info');
   if(S.futuresOn){
